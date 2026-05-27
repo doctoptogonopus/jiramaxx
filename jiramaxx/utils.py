@@ -1,0 +1,32 @@
+import PySimpleGUI as sg
+
+
+def safe_read(window: sg.Window) -> tuple:
+    """window.read() with KeyboardInterrupt treated as window close."""
+    try:
+        return window.read()
+    except KeyboardInterrupt:
+        return sg.WIN_CLOSED, {}
+
+
+def show_error(message: str, tb: str = None, title: str = 'Error'):
+    """Error popup. If tb (traceback string) is provided, shows a 'Show Stack Trace' button."""
+    _no_tb = ('NoneType: None', 'NoneType: None\n', '')
+    has_tb = bool(tb and tb.strip() not in _no_tb)
+
+    layout = [
+        [sg.Text(message, text_color='#ff6b6b')],
+        [sg.HSep()],
+        [
+            *([ sg.Button('Show Stack Trace', key='-TB-') ] if has_tb else []),
+            sg.Button('OK', key='-OK-'),
+        ],
+    ]
+    window = sg.Window(title, layout, finalize=True)
+    while True:
+        event, _ = safe_read(window)
+        if event in (sg.WIN_CLOSED, '-OK-'):
+            break
+        if event == '-TB-':
+            sg.popup_scrolled(tb, title='Stack Trace', size=(90, 24), font=('Courier', 9))
+    window.close()

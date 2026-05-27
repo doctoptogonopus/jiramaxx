@@ -1,0 +1,69 @@
+jira:
+  base_url: https://hanknorworth.atlassian.net
+  api_token: 
+  user_email: 
+  project_key: 
+  board_id: 
+  my_account_id: 
+  custom_fields:
+    story_points: ''
+    epic_link: ''
+    epic_name: ''
+    sprint: JCSD Sprint 1
+  auth_mode: bearer
+  token_type: scoped
+  cloud_id: d4e1e4a7-c843-4b6c-8dcd-29de0cdffcda
+  sprint_cache: []
+cache:
+  directory: ~/.jira_tool/cache
+ui:
+  theme: DarkBlue3
+hotkeys:
+  create_ticket: ctrl+alt+j
+  manage_tickets: ctrl+alt+m
+ticket_types:
+  Story:
+    required:
+    - summary
+    - story_points
+    - description
+    optional:
+    - assignee
+    - labels
+    - sprint
+    - epic_link
+    - priority
+  Bug:
+    required:
+    - summary
+    - description
+    - severity
+    - steps_to_reproduce
+    optional:
+    - assignee
+    - labels
+    - priority
+  Task:
+    required:
+    - summary
+    - description
+    optional:
+    - assignee
+    - story_points
+    - labels
+    - priority
+  Epic:
+    required:
+    - summary
+    - description
+    - epic_name
+    optional:
+    - labels
+    - priority
+  Initiative:
+    required:
+    - summary
+    - description
+    optional:
+    - labels
+    - priority
