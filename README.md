@@ -1,4 +1,4 @@
-# Jira Tool
+# Jiramaxx
 
 A lightweight desktop GUI for creating and managing Jira tickets without leaving your keyboard. Runs as a background daemon and pops up on a global hotkey.
 
@@ -88,7 +88,7 @@ Runs silently in the background. Press the configured hotkeys anywhere on your s
 
 ```
 ┌─────────────────────────────────────┐
-│  Jira Tool                          │
+│  Jiramaxx                          │
 │  2 incomplete draft(s) — press D…   │
 │  ─────────────────────────────────  │
 │  [ (N) New Ticket  ] [ (D) Drafts ] │
@@ -154,7 +154,7 @@ Which fields are required vs. optional is fully configurable per ticket type in 
 
 ## Drafts
 
-Drafts are stored as YAML files in `~/.jira_tool/cache/` (configurable). A draft is created any time you click **Save Draft**. After a successful Jira submission the ticket is also retained locally (marked submitted) so you have a local record.
+Drafts are stored as YAML files in `~/.jiramaxx/cache/` (configurable). A draft is created any time you click **Save Draft**. After a successful Jira submission the ticket is also retained locally (marked submitted) so you have a local record.
 
 ### Draft list actions
 
@@ -200,7 +200,7 @@ Credentials and connection settings. See the Setup section above.
 
 | Setting | Notes |
 |---|---|
-| **Cache Directory** | Where local drafts are stored. Supports `~` expansion. Default: `~/.jira_tool/cache` |
+| **Cache Directory** | Where local drafts are stored. Supports `~` expansion. Default: `~/.jiramaxx/cache` |
 | **UI Theme** | Any valid PySimpleGUI theme name, e.g. `DarkBlue3`, `LightGrey1`, `Reddit`. |
 | **Hotkey: Create** | Global hotkey to open the main window. Default: `ctrl+alt+j` |
 | **Hotkey: Manage** | Global hotkey to open the sprint manager directly. Default: `ctrl+alt+m` |
@@ -255,7 +255,7 @@ jira:
     epic_name:    customfield_10011
 
 cache:
-  directory: ~/.jira_tool/cache
+  directory: ~/.jiramaxx/cache
 
 ui:
   theme: DarkBlue3

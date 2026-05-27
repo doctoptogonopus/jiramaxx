@@ -102,7 +102,7 @@ def main():
     keyboard.add_hotkey(hotkeys['create_ticket'],  lambda: gui_queue.put('main'))
     keyboard.add_hotkey(hotkeys['manage_tickets'], lambda: gui_queue.put('manage'))
 
-    print(f"[jira-tool] Running. {hotkeys['create_ticket']} = new/drafts  |  "
+    print(f"[JIRAMAXXING]. {hotkeys['create_ticket']} = new/drafts  |  "
           f"{hotkeys['manage_tickets']} = manage  |  Ctrl-C = quit")
 
     # Main thread: poll queue and dispatch GUI (tkinter must run on main thread).
@@ -125,7 +125,7 @@ def main():
                 gui_busy.release()
 
     except KeyboardInterrupt:
-        print("\n[jira-tool] Exiting.")
+        print("\n[JIRAMINIMIZING].")
 
 
 if __name__ == '__main__':

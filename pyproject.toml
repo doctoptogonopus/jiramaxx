@@ -3,10 +3,10 @@ name = "jiramaxx"
 version = "0.1.0"
 description = "A lightweight console GUI for creating and managing Jira tickets without leaving your keyboard"
 authors = []
-readme = "jira_tool/README.md"
+readme = "jiramaxx/README.md"
 license = "MIT"
-homepage = "https://github.com/yourusername/jira-tool"
-repository = ""
+homepage = "https://github.com/doctoptogonopus/jiramaxx"
+repository = "https://github.com/doctoptogonopus/jiramaxx"
 keywords = ["jira", "gui", "productivity", "tickets"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -29,7 +29,7 @@ requests = ">=2.28.0"
 keyboard = ">=0.13.5"
 
 [tool.poetry.scripts]
-jiramaxx = "jira_tool.main:main"
+jiramaxx = "jiramaxx.main:main"
 
 [build-system]
 requires = ["poetry-core"]
