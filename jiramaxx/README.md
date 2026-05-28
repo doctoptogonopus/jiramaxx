@@ -315,6 +315,10 @@ The `ticket_types` section is managed by the Config GUI. Hand-editing it is safe
 - Verify your Board ID is correct. It appears in the Jira board URL: `.../boards/2` → `2`.
 - Confirm the board has an active sprint (not just future sprints).
 
+**Disabling the recording feature in a managed environment**
+
+Recording is an optional capability (`pip install jiramaxx[recording]`). To enforce that it stays off even if a user installs the optional dependencies themselves, set the environment variable `JIRAMAXX_DISABLE_RECORDING=1` (accepts `1`, `true`, `yes`, or `on`). When set, `RECORDING_AVAILABLE` is forced to `False` at import time and the recording UI shows a "disabled by environment policy" message instead of the controls. Suitable for group policy / device baseline configuration.
+
 **Recording fails with `AssertionError` from `soundcard/mediafoundation.py` (e.g. `wFormatTag == 0xFFFE`)**
 
 The `soundcard` library expects the device to report its default audio format as `WAVE_FORMAT_EXTENSIBLE`. Some headsets (notably wireless ones like the SteelSeries Arctis line) report a different format tag and trip a hardcoded assertion. To fix:
