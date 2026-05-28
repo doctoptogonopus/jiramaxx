@@ -53,8 +53,8 @@ Use the **"Create API token with scopes"** button (not "Create API token"). This
     - `read:jira-work`
     - `write:jira-work`
 
-_Atlassian's regular tokens are unscoped and incongruent with least-privileged access design. If necessary or unconcerned 🤔 the classic token can be used by selecting "classic" for your Token Type in the Configurations UI. OAuth 2.0 app integrations and cannot be used with direct HTTP Basic authentication._
-_Classic tokens already inherit exactly your Jira account's permission level. For least-privileged access, restrict your account's role on the project in **Jira → Project Settings → Permissions** rather than restricting the token itself._
+_Atlassian's regular tokens are unscoped and incongruent with least-privileged access design. If necessary or unconcerned 🤔 the classic token can be used by selecting "classic" for your Token Type in the Configurations UI._
+_Note: Classic tokens already inherit exactly your Jira account's permission level. For least-privileged access, restrict your account's role on the project in **Jira → Project Settings → Permissions** rather than restricting the token itself._
 
 ---
 
