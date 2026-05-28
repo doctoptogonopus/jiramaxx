@@ -27,11 +27,6 @@ PySimpleGUI = "4.60.5.1"
 pyyaml = ">=6.0"
 requests = ">=2.28.0"
 keyboard = ">=0.13.5"
-soundcard = {version = ">=0.4.2", optional = true}
-faster-whisper = {version = ">=1.0.0", optional = true}
-
-[tool.poetry.extras]
-recording = ["soundcard", "faster-whisper"]
 
 [tool.poetry.scripts]
 jiramaxx = "jiramaxx.main:main"

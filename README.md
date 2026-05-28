@@ -315,15 +315,3 @@ The `ticket_types` section is managed by the Config GUI. Hand-editing it is safe
 - Verify your Board ID is correct. It appears in the Jira board URL: `.../boards/2` → `2`.
 - Confirm the board has an active sprint (not just future sprints).
 
-**Recording fails with `AssertionError` from `soundcard/mediafoundation.py` (e.g. `wFormatTag == 0xFFFE`)**
-
-The `soundcard` library expects the device to report its default audio format as `WAVE_FORMAT_EXTENSIBLE`. Some headsets (notably wireless ones like the SteelSeries Arctis line) report a different format tag and trip a hardcoded assertion. To fix:
-
-1. Open Windows Sound settings (Win+R → `mmsys.cpl`)
-2. **Recording** tab → find the affected device → **Properties**
-3. **Advanced** tab → **Default Format** dropdown
-4. Pick something explicit like `2 channel, 16 bit, 48000 Hz (DVD Quality)` — anything in this dropdown will normally be reported as EXTENSIBLE
-5. Apply, OK
-6. Re-test recording in jiramaxx
-
-If swapping to your laptop's built-in microphone works without this change, the problem is specific to that device's driver and the format override above is the durable fix.

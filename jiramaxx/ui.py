@@ -5,7 +5,6 @@ from .cache import Cache
 from .api import JiraClient
 import traceback as _tb
 from .utils import safe_read as _read, show_error, bring_to_front
-from .recording import RECORDING_AVAILABLE, _DISABLED_BY_ENV as _RECORDING_DISABLED_BY_ENV
 
 _LABEL_W = 22
 _INPUT_W = 42
@@ -305,12 +304,6 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
 
     drafts = cache.drafts()
 
-    if RECORDING_AVAILABLE:
-        _rec_tip = 'Start/stop meeting recording'
-    elif _RECORDING_DISABLED_BY_ENV:
-        _rec_tip = 'Recording disabled by environment policy (JIRAMAXX_DISABLE_RECORDING)'
-    else:
-        _rec_tip = 'Install jiramaxx[recording] to enable'
     layout = [
         [sg.Text('Jira Tool', font=('Helvetica', 16, 'bold'))],
         [sg.Text(_draft_msg(len(drafts)), key='-MSG-', font=('Helvetica', 10))],
@@ -321,10 +314,6 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
         [sg.Button('(M) Manage Tickets', key='-MANAGE-', size=(18, 2)),
          sg.Button('(C) Config',         key='-CONFIG-', size=(18, 2))],
         [sg.Button('(Q) Quit',           key='-QUIT-',   size=(38, 1))],
-        [sg.Push(),
-         sg.Button('⏺ Record', key='-RECORD-', size=(10, 1), font=('Helvetica', 8),
-                   button_color=('white', '#5a1a1a'),
-                   disabled=not RECORDING_AVAILABLE, tooltip=_rec_tip)],
     ]
     window = sg.Window('Jira Tool', layout, finalize=True)
     window.bind('<Escape>', '-QUIT-')
@@ -336,61 +325,13 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
                    ('q', '-QUIT-'),   ('Q', '-QUIT-')]:
         window.bind(ch, ev)
 
-    _session = None  # active RecordingSession or None
-
     while True:
         event, _ = _read(window)
 
         if event in (sg.WIN_CLOSED, '-QUIT-'):
-            if _session is not None:
-                _session.stop(wait_for_transcription=False)
             break
 
-        if event == '-RECORD-':
-            if _session is None:
-                from .recording import RecordingSession
-                try:
-                    _new_session = RecordingSession(config)
-                    _new_session.start()
-                    _session = _new_session
-                    window['-RECORD-'].update('⏹ Stop',
-                                              button_color=('white', '#c62828'))
-                except Exception as exc:
-                    show_error(f"Could not start recording:\n{exc}",
-                               tb=_tb.format_exc(), title='Recording Error')
-            else:
-                import threading as _th
-                window['-RECORD-'].update('Saving…', disabled=True)
-                _stop_thread = _th.Thread(
-                    target=_session.stop,
-                    kwargs={'wait_for_transcription': True}, daemon=True)
-                _stop_thread.start()
-
-                _prog_layout = [
-                    [sg.Text('Finishing transcription…',
-                             font=('Helvetica', 11))],
-                    [sg.Text('This may take up to a minute.',
-                             font=('Helvetica', 9, 'italic'))],
-                ]
-                _prog_win = sg.Window('Saving Recording', _prog_layout,
-                                      modal=True, finalize=True,
-                                      disable_close=True, keep_on_top=True)
-                while _stop_thread.is_alive():
-                    _prog_win.read(timeout=200)
-                _prog_win.close()
-
-                sg.popup_quick_message(
-                    f"Recording saved.\n"
-                    f"Transcript: {_session.transcript_path}\n"
-                    f"Suggestions: {_session.suggestions_dir}",
-                    auto_close_duration=4,
-                    background_color='#2e7d32', text_color='white',
-                )
-                _session = None
-                window['-RECORD-'].update('⏺ Record', disabled=False,
-                                          button_color=('white', '#5a1a1a'))
-
-        elif event == '-NEW-':
+        if event == '-NEW-':
             window.hide()
             ticket_type = show_type_selector()
             if ticket_type:

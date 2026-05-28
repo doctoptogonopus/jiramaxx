@@ -15,8 +15,6 @@ import PySimpleGUI as sg
 from .api import JiraClient
 from .models import FIELD_META, TICKET_CLASSES, init_ticket_config, init_jira_config
 from .utils import safe_read, show_error, bring_to_front
-from .recording import RECORDING_AVAILABLE, list_devices
-from .recording import _DISABLED_BY_ENV as _RECORDING_DISABLED_BY_ENV
 
 ALL_FIELDS = list(FIELD_META.keys())
 TICKET_TYPES = list(TICKET_CLASSES.keys())
@@ -206,68 +204,6 @@ def _types_tab(type_fields: dict, current_type: str) -> list:
     ]
 
 
-# ── Recording tab ────────────────────────────────────────────────────────────
-
-def _recording_tab(config: dict) -> list:
-    if not RECORDING_AVAILABLE:
-        if _RECORDING_DISABLED_BY_ENV:
-            return [
-                [sg.Text('Recording disabled by environment policy.',
-                         font=('Helvetica', 11, 'bold'))],
-                [sg.Text('JIRAMAXX_DISABLE_RECORDING is set in your environment.',
-                         font=('Helvetica', 9))],
-                [sg.Text('Contact your administrator to enable this feature.',
-                         font=('Helvetica', 9, 'italic'))],
-            ]
-        return [
-            [sg.Text('Recording feature not installed.', font=('Helvetica', 11, 'bold'))],
-            [sg.Text('Run:  pip install jiramaxx[recording]', font=('Courier', 10))],
-            [sg.Text('Then restart the application.', font=('Helvetica', 9, 'italic'))],
-        ]
-
-    rec = config.get('recording', {})
-    keywords = list(rec.get('keywords', ['', '', '']))
-    while len(keywords) < 3:
-        keywords.append('')
-
-    W_LBL, W_IN = 20, 26
-    _lang_tip = ('Multi-language support is not yet implemented — '
-                 'let me know if you want this enabled.')
-    return [
-        [sg.Text('Audio Devices', font=('Helvetica', 10, 'bold'))],
-        [sg.Text('Input (microphone)', size=(W_LBL, 1)),
-         sg.Input(rec.get('input_device', ''), key='-REC-input_device-', size=(W_IN, 1)),
-         sg.Button('Browse', key='-BROWSE-INPUT-', size=(7, 1))],
-        [sg.Text('Output (loopback)', size=(W_LBL, 1)),
-         sg.Input(rec.get('loopback_device', ''), key='-REC-loopback_device-', size=(W_IN, 1)),
-         sg.Button('Browse', key='-BROWSE-LOOPBACK-', size=(7, 1))],
-        [sg.HSep()],
-        [sg.Text('Transcription', font=('Helvetica', 10, 'bold'))],
-        [sg.Text('Language', size=(W_LBL, 1)),
-         sg.Combo(['English', 'Spanish', 'French', 'German', 'Italian',
-                   'Portuguese', 'Japanese', 'Mandarin'],
-                  default_value='English', key='-REC-language-',
-                  size=(W_IN - 2, 1), readonly=True, disabled=True,
-                  tooltip=_lang_tip)],
-        [sg.HSep()],
-        [sg.Text('Paths', font=('Helvetica', 10, 'bold'))],
-        [sg.Text('Transcript directory', size=(W_LBL, 1)),
-         sg.Input(rec.get('transcript_dir', '~/.jiramaxx/transcripts'),
-                  key='-REC-transcript_dir-', size=(W_IN, 1)),
-         sg.FolderBrowse('Browse', target='-REC-transcript_dir-', size=(7, 1))],
-        [sg.Text('Suggestions directory', size=(W_LBL, 1)),
-         sg.Input(rec.get('suggestions_dir', '~/.jiramaxx/suggestions'),
-                  key='-REC-suggestions_dir-', size=(W_IN, 1)),
-         sg.FolderBrowse('Browse', target='-REC-suggestions_dir-', size=(7, 1))],
-        [sg.HSep()],
-        [sg.Text('Keyword triggers  (up to 3 — saves surrounding 30s chunks as suggestions)',
-                 font=('Helvetica', 10, 'bold'))],
-        *[[sg.Text(f'Keyword {i + 1}', size=(W_LBL, 1)),
-           sg.Input(keywords[i], key=f'-REC-keyword{i}-', size=(W_IN, 1))]
-          for i in range(3)],
-    ]
-
-
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def show_config_window(config: dict, config_path: Path) -> dict | None:
@@ -290,7 +226,6 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             sg.Tab('Jira',         _jira_tab(working)),
             sg.Tab('App Settings', _app_tab(working)),
             sg.Tab('Ticket Types', _types_tab(type_fields, current_type)),
-            sg.Tab('Recording',    _recording_tab(working)),
         ]])],
         [sg.Push(),
          sg.Button('Save', key='-SAVE-'),
@@ -547,32 +482,6 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                 finally:
                     uw.close()
 
-        # ── Recording device browse ───────────────────────────────────────
-        elif event in ('-BROWSE-INPUT-', '-BROWSE-LOOPBACK-'):
-            loopbacks, inputs = list_devices()
-            is_lb = event == '-BROWSE-LOOPBACK-'
-            names = loopbacks if is_lb else inputs
-            title = 'Loopback Devices (Teams audio output)' if is_lb else 'Input Devices (microphone)'
-            target_key = '-REC-loopback_device-' if is_lb else '-REC-input_device-'
-            if not names:
-                sg.popup(f"No {'loopback' if is_lb else 'input'} devices found.",
-                         title=title, modal=True, keep_on_top=True)
-            else:
-                lay = [
-                    [sg.Text(title, font=('Helvetica', 10, 'bold'))],
-                    [sg.Listbox(names, size=(60, min(len(names) + 1, 8)),
-                                key='-DEV-', select_mode='single', enable_events=True)],
-                    [sg.Button('Select', key='-SEL-'), sg.Button('Cancel', key='-CAN-')],
-                ]
-                dw = sg.Window(title, lay, finalize=True, modal=True)
-                dw.bind('<Return>', '-SEL-')
-                dw.bind('<Escape>', '-CAN-')
-                bring_to_front(dw)
-                de, dv = safe_read(dw)
-                dw.close()
-                if de in ('-SEL-', '-DEV-') and dv.get('-DEV-'):
-                    window[target_key].update(dv['-DEV-'][0])
-
         # ── Refresh Sprints ────────────────────────────────────────────────
         elif event == '-REFRESH-SPRINTS-':
             proj  = values.get('-CFG-jira.project_key-', '').strip()
@@ -606,16 +515,6 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                 working['ticket_types'][t] = {
                     'required': state['required'],
                     'optional': state['optional'],
-                }
-            if RECORDING_AVAILABLE:
-                working['recording'] = {
-                    'input_device':   values.get('-REC-input_device-', ''),
-                    'loopback_device': values.get('-REC-loopback_device-', ''),
-                    'transcript_dir': values.get('-REC-transcript_dir-',
-                                                 '~/.jiramaxx/transcripts'),
-                    'suggestions_dir': values.get('-REC-suggestions_dir-',
-                                                  '~/.jiramaxx/suggestions'),
-                    'keywords': [values.get(f'-REC-keyword{i}-', '') for i in range(3)],
                 }
             with open(config_path, 'w') as f:
                 yaml.dump(working, f, default_flow_style=False, sort_keys=False)
