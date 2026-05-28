@@ -1,5 +1,5 @@
 jira:
-  base_url:
+  base_url: 
   api_token:
   user_email:
   project_key:
@@ -9,11 +9,11 @@ jira:
     story_points: ''
     epic_link: ''
     epic_name: ''
-    sprint:
+    sprint: ''
   auth_mode: bearer
   token_type: scoped
   cloud_id:
-  sprint_cache: []
+  sprint_cache:
 cache:
   directory: ~/.jira_tool/cache
 ui:

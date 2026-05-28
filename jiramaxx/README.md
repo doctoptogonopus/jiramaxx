@@ -10,7 +10,7 @@ A lightweight desktop GUI for creating and managing Jira tickets without leaving
 - A Jira Cloud account with an API token
 
 ```
-pip install -r requirements.txt
+poetry install
 ```
 
 ---
@@ -20,10 +20,13 @@ pip install -r requirements.txt
 ### 1. First run
 
 ```
-python main.py --gui
+jiramaxx
+OR
+jiramaxx --gui
 ```
 
-On first run with no `config.yaml`, a default one is created and the app exits. Fill in your credentials (see below) and run again, or use the in-app Config screen.
+On first run with no `config.yaml`, a default one is created and the widget requires you to fill in your credentials (see below) and run again, or use the in-widget Config screen.
+_If running with --gui flag, the script will stop running upon exiting rendering shortcuts unavailable._
 
 ### 2. Configure credentials
 
@@ -44,9 +47,14 @@ Click **Browse** next to the Project Key field. The tool will connect to Jira us
 
 #### API Token — important notes
 
-Use the **"Create API token"** button (not "Create API token with scopes"). Atlassian's scoped tokens are designed for OAuth 2.0 app integrations and cannot be used with direct HTTP Basic authentication.
+Use the **"Create API token with scopes"** button (not "Create API token"). This leverages OAuth 2.0 and allows you to disable unecessary permissions for the token.
+**Required Scopes:**
+    - `read:jira-user`
+    - `read:jira-work`
+    - `write:jira-work`
 
-Classic tokens already inherit exactly your Jira account's permission level. For least-privileged access, restrict your account's role on the project in **Jira → Project Settings → Permissions** rather than restricting the token itself.
+_Atlassian's regular tokens are unscoped and incongruent with least-privileged access design. If necessary or unconcerned 🤔 the classic token can be used by selecting "classic" for your Token Type in the Configurations UI. OAuth 2.0 app integrations and cannot be used with direct HTTP Basic authentication._
+_Classic tokens already inherit exactly your Jira account's permission level. For least-privileged access, restrict your account's role on the project in **Jira → Project Settings → Permissions** rather than restricting the token itself._
 
 ---
 
@@ -56,9 +64,10 @@ Jira stores certain fields under instance-specific IDs (e.g. `customfield_10016`
 
 | Setting | What it controls | Common value |
 |---|---|---|
-| **Story Points field** | The custom field used to store story point estimates | `customfield_10016` |
-| **Epic Link field** | The custom field that links a Story/Task to an Epic | `customfield_10014` |
-| **Epic Name field** | The custom field for an Epic's short name label | `customfield_10011` |
+| **Story Points field**  | The custom field used to store story point estimates | `customfield_10016` |
+| **Epic Link field**     | The custom field that links a Story/Task to an Epic | `customfield_10014` |
+| **Epic Name field**     | The custom field for an Epic's short name label | `customfield_10011` |
+| **Sprint Name field**   | The custom field for the Sprints in the selected Jira Project Key  | `customfield_10020` |
 
 Leave these blank to use the defaults above. If story points are not saving, this is the first thing to check.
 
@@ -69,18 +78,18 @@ Leave these blank to use the defaults above. If story points are not saving, thi
 ### GUI mode (direct)
 
 ```
-python main.py --gui
+jiramaxx --gui
 ```
 
-Opens the main window immediately. Use this for day-to-day ticket creation.
+Opens the main window immediately. Use this for one-off ticket creation.
 
 ### Daemon mode (background hotkey listener)
 
 ```
-python main.py
+jiramaxx
 ```
 
-Runs silently in the background. Press the configured hotkeys anywhere on your system to open the GUI. Press **Ctrl-C** in the terminal to quit.
+Runs silently in the background allowing you to open the widget on demand. Press the configured hotkeys anywhere on your system to open the GUI. **Exit widget** & press **Ctrl-C** in the terminal to quit.
 
 ---
 
@@ -190,13 +199,13 @@ Select a ticket and press **S** (or click Change Status). The tool fetches the a
 
 ## Configuration Editor
 
-Press **C** on the main window to open the full config editor. Changes take effect in the running app immediately on Save — no restart needed.
+Press **C** on the main window to open the full config editor. Changes take effect immediately on Save — no restart needed.
 
 ### Jira tab
 
 Credentials and connection settings. See the Setup section above.
 
-### App Settings tab
+### Widget Settings tab
 
 | Setting | Notes |
 |---|---|
