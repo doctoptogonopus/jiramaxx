@@ -221,6 +221,17 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             cloud_id=v.get('-CFG-jira.cloud_id-', '').strip(),
         )
 
+    def _cloud_id_ok(v: dict) -> bool:
+        """False (and shows a popup) if scoped mode is selected without Cloud ID."""
+        if v.get('-CFG-jira.token_type-', '') == 'scoped' \
+                and not v.get('-CFG-jira.cloud_id-', '').strip():
+            sg.popup('Cloud ID is required when Token Type is "scoped".\n\n'
+                     'Click "Discover" next to the Cloud ID field to populate it '
+                     'automatically, or fill it in manually.',
+                     title='Missing Cloud ID', modal=True, keep_on_top=True)
+            return False
+        return True
+
     layout = [
         [sg.TabGroup([[
             sg.Tab('Jira',         _jira_tab(working)),
@@ -323,6 +334,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             if not all([url, token]):
                 sg.popup('Fill in Base URL and API Token first.',
                          title='Test Connection', modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
             else:
                 try:
                     import traceback
@@ -365,6 +378,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             if not all([url, token]):
                 sg.popup('Fill in Base URL and API Token first.',
                          title='Browse Projects', modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
             else:
                 try:
                     tmp = _make_client(values)
@@ -405,6 +420,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             if not token:
                 sg.popup('Fill in API Token first.', title='Browse Users',
                          modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
             else:
                 tmp = _make_client(values)
                 default_query = values.get('-CFG-jira.user_email-', '').strip()
@@ -490,6 +507,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             if not all([token, proj]):
                 sg.popup('Fill in API Token and Project Key first.',
                          title='Refresh Sprints', modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
             else:
                 try:
                     tmp = _make_client(values)
