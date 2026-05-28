@@ -62,12 +62,13 @@ def _prompt_setup(config: dict) -> dict:
     from .config_ui import show_config_window
     sg.popup(
         'No API token found.\n\nFill in your Jira credentials to get started.',
-        title='Setup Required',
+        title='Setup Required', modal=True, keep_on_top=True,
     )
     updated = show_config_window(config, CONFIG_PATH)
     if updated and is_configured(updated):
         return updated
-    sg.popup('An API token is required. Exiting.', title='Setup Required')
+    sg.popup('An API token is required. Exiting.', title='Setup Required',
+             modal=True, keep_on_top=True)
     sys.exit(0)
 
 

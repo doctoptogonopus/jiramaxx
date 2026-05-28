@@ -4,7 +4,7 @@ from .models import Ticket, TICKET_CLASSES, FIELD_META
 from .cache import Cache
 from .api import JiraClient
 import traceback as _tb
-from .utils import safe_read as _read, show_error
+from .utils import safe_read as _read, show_error, bring_to_front
 
 _LABEL_W = 22
 _INPUT_W = 42
@@ -63,6 +63,7 @@ def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dic
     window = sg.Window(f'Jira Tool – {ticket.ticket_type}', layout,
                        finalize=True, return_keyboard_events=False)
     window.bind('<Escape>', '-CANCEL-')
+    bring_to_front(window)
 
     def _tab_out(event):
         event.widget.tk_focusNext().focus()
@@ -133,8 +134,9 @@ def show_type_selector() -> str | None:
         *[[sg.Button(f'({t[0]}) {t}', key=t, size=(16, 2))] for t in TICKET_CLASSES],
         [sg.Button('Cancel', key='-CANCEL-', size=(16, 1))],
     ]
-    window = sg.Window('New Ticket', layout, finalize=True)
+    window = sg.Window('New Ticket', layout, finalize=True, modal=True)
     window.bind('<Escape>', '-CANCEL-')
+    bring_to_front(window)
     for i, t in enumerate(TICKET_CLASSES, 1):
         window.bind(str(i), t)
         window.bind(t[0].lower(), t)
@@ -150,7 +152,7 @@ def show_type_selector() -> str | None:
 def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
     """Show drafts, let user open or delete one. Returns the ticket to open, or None."""
     if not drafts:
-        sg.popup('No drafts found.', title='Drafts')
+        sg.popup('No drafts found.', title='Drafts', modal=True, keep_on_top=True)
         return None
 
     labels = [f"[{t.ticket_type:10s}]  {t.summary or '(no title)':40s}  {t.created_at[:10]}"
@@ -164,8 +166,10 @@ def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
          sg.Button('Delete', key='-DELETE-'),
          sg.Button('Cancel', key='-CANCEL-')],
     ]
-    window = sg.Window('Drafts', layout, finalize=True, return_keyboard_events=False)
+    window = sg.Window('Drafts', layout, finalize=True,
+                       return_keyboard_events=False, modal=True)
     window.bind('<Escape>', '-CANCEL-')
+    bring_to_front(window)
     window.bind('<Return>', '-OPEN-')
 
     result = None
@@ -176,7 +180,7 @@ def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
 
         sel = values.get('-LIST-')
         if not sel and event in ('-OPEN-', '-DELETE-'):
-            sg.popup('Select a draft first.')
+            sg.popup('Select a draft first.', modal=True, keep_on_top=True)
             continue
 
         if sel:
@@ -208,7 +212,7 @@ def show_interaction_window(jira: JiraClient, config: dict):
         return
 
     if not issues:
-        sg.popup('No active sprint tickets found.')
+        sg.popup('No active sprint tickets found.', modal=True, keep_on_top=True)
         return
 
     labels = [f"{i['key']:12s}  {i['fields']['summary']}" for i in issues]
@@ -224,6 +228,7 @@ def show_interaction_window(jira: JiraClient, config: dict):
     ]
     window = sg.Window('Manage Tickets', layout, finalize=True)
     window.bind('<Escape>', '-CANCEL-')
+    bring_to_front(window)
     for ch, ev in [('c', '-COMMENT-'), ('C', '-COMMENT-'),
                    ('s', '-STATUS-'),  ('S', '-STATUS-'),
                    ('x', '-CANCEL-'),  ('X', '-CANCEL-')]:
@@ -239,7 +244,7 @@ def show_interaction_window(jira: JiraClient, config: dict):
 
         sel = values.get('-LIST-')
         if not sel:
-            sg.popup('Select a ticket first.')
+            sg.popup('Select a ticket first.', modal=True, keep_on_top=True)
             continue
 
         idx = labels.index(sel[0])
@@ -266,8 +271,9 @@ def show_interaction_window(jira: JiraClient, config: dict):
                                 key='-T-', select_mode=sg.LISTBOX_SELECT_MODE_SINGLE)],
                     [sg.Button('Apply', key='-APPLY-'), sg.Button('Cancel', key='-TCANCEL-')],
                 ]
-                tw = sg.Window('Change Status', layout_s, finalize=True)
+                tw = sg.Window('Change Status', layout_s, finalize=True, modal=True)
                 tw.bind('<Escape>', '-TCANCEL-')
+                bring_to_front(tw)
                 tw.bind('<Return>', '-APPLY-')
                 tevt, tvals = _read(tw)
                 tw.close()
@@ -311,6 +317,7 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
     ]
     window = sg.Window('Jira Tool', layout, finalize=True)
     window.bind('<Escape>', '-QUIT-')
+    bring_to_front(window)
     for ch, ev in [('n', '-NEW-'), ('N', '-NEW-'),
                    ('d', '-DRAFTS-'), ('D', '-DRAFTS-'),
                    ('m', '-MANAGE-'), ('M', '-MANAGE-'),
@@ -331,6 +338,7 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
                 ticket = TICKET_CLASSES[ticket_type]()
                 show_ticket_form(ticket, cache, jira, config)
             window.un_hide()
+            bring_to_front(window)
 
         elif event == '-DRAFTS-':
             window.hide()
@@ -339,11 +347,13 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
             if chosen:
                 show_ticket_form(chosen, cache, jira, config)
             window.un_hide()
+            bring_to_front(window)
 
         elif event == '-MANAGE-':
             window.hide()
             show_interaction_window(jira, config)
             window.un_hide()
+            bring_to_front(window)
 
         elif event == '-CONFIG-':
             window.hide()
@@ -361,6 +371,7 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
                 )
                 cache = Cache(config.get('cache', {}).get('directory', '~/.jira_tool/cache'))
             window.un_hide()
+            bring_to_front(window)
 
         drafts = cache.drafts()
         window['-MSG-'].update(_draft_msg(len(drafts)))

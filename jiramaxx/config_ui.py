@@ -14,7 +14,7 @@ import PySimpleGUI as sg
 
 from .api import JiraClient
 from .models import FIELD_META, TICKET_CLASSES, init_ticket_config, init_jira_config
-from .utils import safe_read, show_error
+from .utils import safe_read, show_error, bring_to_front
 
 ALL_FIELDS = list(FIELD_META.keys())
 TICKET_TYPES = list(TICKET_CLASSES.keys())
@@ -134,11 +134,16 @@ def _jira_tab(config: dict) -> list:
                          sg.Input(_nested_get(config, key), key=f'-CFG-{key}-',
                                   size=(32, 1), enable_events=True),
                          sg.Button('Discover', key='-DISCOVER-CLOUD-', size=(9, 1))])
+        elif key == 'jira.my_account_id':
+            rows.append([sg.Text(label, size=(14, 1)),
+                         sg.Input(_nested_get(config, key), key=f'-CFG-{key}-',
+                                  size=(32, 1), enable_events=True),
+                         sg.Button('Browse', key='-BROWSE-ACCOUNT-', size=(8, 1))])
         else:
             rows.append([sg.Text(label, size=(14, 1)),
                          sg.Input(_nested_get(config, key), key=f'-CFG-{key}-',
                                   size=(42, 1), password_char=pw, enable_events=True)])
-    sprint_names = [s['name'] for s in config.get('jira', {}).get('sprint_cache', [])]
+    sprint_names = [s['name'] for s in (config.get('jira', {}).get('sprint_cache') or [])]
     sprint_summary = f"{len(sprint_names)} cached" if sprint_names else "none cached"
     rows += [
         [sg.HSep()],
@@ -216,6 +221,17 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             cloud_id=v.get('-CFG-jira.cloud_id-', '').strip(),
         )
 
+    def _cloud_id_ok(v: dict) -> bool:
+        """False (and shows a popup) if scoped mode is selected without Cloud ID."""
+        if v.get('-CFG-jira.token_type-', '') == 'scoped' \
+                and not v.get('-CFG-jira.cloud_id-', '').strip():
+            sg.popup('Cloud ID is required when Token Type is "scoped".\n\n'
+                     'Click "Discover" next to the Cloud ID field to populate it '
+                     'automatically, or fill it in manually.',
+                     title='Missing Cloud ID', modal=True, keep_on_top=True)
+            return False
+        return True
+
     layout = [
         [sg.TabGroup([[
             sg.Tab('Jira',         _jira_tab(working)),
@@ -229,6 +245,7 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
     ]
     window = sg.Window('Configuration', layout, finalize=True)
     window.bind('<Escape>', '-CANCEL-')
+    bring_to_front(window)
 
     # Capture initial form state for change detection
     _, _orig_vals = window.read(timeout=0)
@@ -316,7 +333,9 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             proj  = values.get('-CFG-jira.project_key-', '').strip()
             if not all([url, token]):
                 sg.popup('Fill in Base URL and API Token first.',
-                         title='Test Connection')
+                         title='Test Connection', modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
             else:
                 try:
                     import traceback
@@ -331,7 +350,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                             lines.append(f"CREATE_ISSUES permission  →  {'✓ YES' if can_create else '✗ NO — this is why tickets fail'}")
                         except Exception as pe:
                             lines.append(f"Project  →  {proj}  ✗ not found or no access: {pe}")
-                    sg.popup('\n'.join(lines), title='Connection Test', font=('Courier', 10))
+                    sg.popup('\n'.join(lines), title='Connection Test',
+                             font=('Courier', 10), modal=True, keep_on_top=True)
                 except Exception as exc:
                     import traceback
                     show_error(f"Connection failed:\n{exc}", tb=traceback.format_exc())
@@ -340,7 +360,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
         elif event == '-DISCOVER-CLOUD-':
             url = values.get('-CFG-jira.base_url-', '').strip()
             if not url:
-                sg.popup('Fill in Base URL first.', title='Discover Cloud ID')
+                sg.popup('Fill in Base URL first.', title='Discover Cloud ID',
+                         modal=True, keep_on_top=True)
             else:
                 try:
                     cloud_id = JiraClient.discover_cloud_id(url)
@@ -356,7 +377,9 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             token = values.get('-CFG-jira.api_token-', '').strip()
             if not all([url, token]):
                 sg.popup('Fill in Base URL and API Token first.',
-                         title='Browse Projects')
+                         title='Browse Projects', modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
             else:
                 try:
                     tmp = _make_client(values)
@@ -373,9 +396,10 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                         [sg.Button('Select', key='-PSEL-'),
                          sg.Button('Cancel', key='-PCNL-')],
                     ]
-                    pw = sg.Window('Projects', lay, finalize=True)
+                    pw = sg.Window('Projects', lay, finalize=True, modal=True)
                     pw.bind('<Return>', '-PSEL-')
                     pw.bind('<Escape>', '-PCNL-')
+                    bring_to_front(pw)
                     while True:
                         pe, pv = safe_read(pw)
                         if pe in (sg.WIN_CLOSED, '-PCNL-'):
@@ -390,6 +414,91 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                     show_error(f"Could not fetch projects:\n{exc}",
                                tb=traceback.format_exc())
 
+        # ── Browse Account ID (Jira user search) ──────────────────────────
+        elif event == '-BROWSE-ACCOUNT-':
+            token = values.get('-CFG-jira.api_token-', '').strip()
+            if not token:
+                sg.popup('Fill in API Token first.', title='Browse Users',
+                         modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
+            else:
+                tmp = _make_client(values)
+                default_query = values.get('-CFG-jira.user_email-', '').strip()
+
+                lay = [
+                    [sg.Text('Search users (name or email):',
+                             font=('Helvetica', 11, 'bold'))],
+                    [sg.Input(default_query, key='-UQ-', size=(40, 1)),
+                     sg.Button('Search', key='-USEARCH-', bind_return_key=True)],
+                    [sg.Listbox([], size=(60, 10), key='-UL-',
+                                select_mode='single', enable_events=True)],
+                    [sg.Button('Use My Account', key='-UMYSELF-'),
+                     sg.Push(),
+                     sg.Button('Select', key='-USEL-'),
+                     sg.Button('Cancel', key='-UCNL-')],
+                ]
+                uw = sg.Window('Browse Users', lay, finalize=True, modal=True)
+                uw.bind('<Escape>', '-UCNL-')
+                bring_to_front(uw)
+
+                users_data: list[tuple[str, str]] = []
+
+                def _do_search(q: str):
+                    q = q.strip()
+                    if not q:
+                        return
+                    try:
+                        users = tmp._get('/rest/api/3/user/search',
+                                         {'query': q, 'maxResults': 30})
+                    except Exception as exc:
+                        import traceback
+                        show_error(f"Could not search users:\n{exc}",
+                                   tb=traceback.format_exc())
+                        return
+                    if not isinstance(users, list):
+                        users = []
+                    users_data.clear()
+                    for u in users:
+                        label = (f"{u.get('displayName', '?')}  "
+                                 f"({u.get('emailAddress', 'no email')})  →  "
+                                 f"{u.get('accountId', '?')}")
+                        users_data.append((label, u.get('accountId', '')))
+                    uw['-UL-'].update([d for d, _ in users_data])
+
+                try:
+                    if default_query:
+                        _do_search(default_query)
+
+                    while True:
+                        ue, uv = safe_read(uw)
+                        if ue in (sg.WIN_CLOSED, '-UCNL-'):
+                            break
+                        if ue == '-USEARCH-':
+                            _do_search(uv.get('-UQ-', ''))
+                        elif ue == '-UMYSELF-':
+                            try:
+                                me = tmp.get_myself()
+                            except Exception as exc:
+                                import traceback
+                                show_error(f"Could not load your account:\n{exc}",
+                                           tb=traceback.format_exc())
+                                continue
+                            aid = me.get('accountId', '')
+                            if aid:
+                                window['-CFG-jira.my_account_id-'].update(aid)
+                            break
+                        elif ue in ('-USEL-', '-UL-') and uv.get('-UL-'):
+                            chosen = uv['-UL-'][0]
+                            for d, aid in users_data:
+                                if d == chosen and aid:
+                                    window['-CFG-jira.my_account_id-'].update(aid)
+                                    break
+                            if ue == '-USEL-':
+                                break
+                finally:
+                    uw.close()
+
         # ── Refresh Sprints ────────────────────────────────────────────────
         elif event == '-REFRESH-SPRINTS-':
             proj  = values.get('-CFG-jira.project_key-', '').strip()
@@ -397,7 +506,9 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             sprint_cf = values.get('-CFG-jira.custom_fields.sprint-', '').strip() or 'customfield_10020'
             if not all([token, proj]):
                 sg.popup('Fill in API Token and Project Key first.',
-                         title='Refresh Sprints')
+                         title='Refresh Sprints', modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
             else:
                 try:
                     tmp = _make_client(values)

@@ -30,7 +30,7 @@ def init_ticket_config(ticket_types_config: dict):
 def init_jira_config(jira_config: dict):
     global _JIRA_CONFIG
     _JIRA_CONFIG = jira_config or {}
-    sprints = _JIRA_CONFIG.get('sprint_cache', [])
+    sprints = _JIRA_CONFIG.get('sprint_cache') or []
     FIELD_META['sprint']['options'] = ['(Backlog)'] + [s['name'] for s in sprints]
 
 
@@ -175,7 +175,7 @@ class Ticket(ABC):
             payload['fields'][el_field] = link
         if self.sprint and self.sprint != '(Backlog)':
             sp_cf = cf.get('sprint') or 'customfield_10020'
-            cache = _JIRA_CONFIG.get('sprint_cache', [])
+            cache = _JIRA_CONFIG.get('sprint_cache') or []
             sprint_id = next((s['id'] for s in cache if s['name'] == self.sprint), None)
             if sprint_id:
                 payload['fields'][sp_cf] = sprint_id
