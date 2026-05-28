@@ -74,7 +74,7 @@ class JiraClient:
     def get_sprints(self, project_key: str, sprint_cf: str = 'customfield_10020') -> list[dict]:
         """Extract sprint metadata from issue fields — no Agile API scope required."""
         data = self._get('/rest/api/3/search/jql', {
-            'jql': f'project="{project_key}" AND sprint is not EMPTY ORDER BY updated DESC',
+            'jql': f'project="{project_key}" AND sprint not in closedSprints() ORDER BY updated DESC',
             'maxResults': 100,
             'fields': sprint_cf,
         })
@@ -85,7 +85,7 @@ class JiraClient:
                 if isinstance(s, dict) and s.get('id') not in seen:
                     seen.add(s['id'])
                     sprints.append({'id': s['id'], 'name': s.get('name', ''),
-                                    'state': s.get('state', '')})
+                                    'state': s.get('state', '').lower()})
         # active first, then future, drop closed
         order = {'active': 0, 'future': 1}
         return [s for s in sorted(sprints, key=lambda x: order.get(x['state'], 99))

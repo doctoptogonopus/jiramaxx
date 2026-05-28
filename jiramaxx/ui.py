@@ -78,6 +78,10 @@ def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dic
             window[_fkey(_f)].Widget.bind('<Tab>', _tab_out)
             window[_fkey(_f)].Widget.bind('<Shift-Tab>', _shift_tab_out)
 
+    _all_fields = ticket.all_form_fields()
+    if _all_fields:
+        window[_fkey(_all_fields[0])].set_focus()
+
     result = 'cancelled'
     while True:
         event, values = _read(window)

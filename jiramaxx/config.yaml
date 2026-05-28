@@ -1,19 +1,19 @@
 jira:
-  base_url: https://hanknorworth.atlassian.net
-  api_token: 
-  user_email: 
-  project_key: 
-  board_id: 
-  my_account_id: 
+  base_url: 
+  api_token:
+  user_email:
+  project_key:
+  board_id:
+  my_account_id:
   custom_fields:
     story_points: ''
     epic_link: ''
     epic_name: ''
-    sprint: JCSD Sprint 1
+    sprint: ''
   auth_mode: bearer
   token_type: scoped
-  cloud_id: d4e1e4a7-c843-4b6c-8dcd-29de0cdffcda
-  sprint_cache: []
+  cloud_id:
+  sprint_cache:
 cache:
   directory: ~/.jira_tool/cache
 ui:
