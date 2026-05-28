@@ -403,6 +403,7 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                     tmp = _make_client(values)
                     sprints = tmp.get_sprints(proj, sprint_cf)
                     working.setdefault('jira', {})['sprint_cache'] = sprints
+                    init_jira_config(working.get('jira', {}))
                     names = [s['name'] for s in sprints]
                     window['-SPRINT-STATUS-'].update(
                         f"Sprint cache: {len(sprints)} cached — {', '.join(names) or 'none'}")
