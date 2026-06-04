@@ -25,6 +25,48 @@ _DISABLED_BY_ENV = os.environ.get('JIRAMAXX_DISABLE_RECORDING', '').strip().lowe
 _REC_KEY = '-RECORD-'
 
 
+def _ensure_model(model_path: str, model_name: str) -> bool:
+    """Confirm and download the selected model with a blocking progress window.
+    Returns True only when the model is ready; False if declined or failed.
+    Only ever called from an explicit user action — never auto-downloads."""
+    from .engine import prepare_model, _MODEL_APPROX_MB, DEFAULT_MODEL
+    name = model_name or DEFAULT_MODEL
+    mb = _MODEL_APPROX_MB.get(name, '?')
+    if sg.popup_yes_no(
+            f"The transcription model '{name}' (~{mb} MB) needs to download "
+            f"from Hugging Face first.\n\nDownload now? Recording won't start "
+            f"until it finishes.",
+            title='Download model', modal=True, keep_on_top=True) != 'Yes':
+        return False
+
+    result: dict = {}
+
+    def _work():
+        try:
+            prepare_model(model_path, name)
+            result['ok'] = True
+        except Exception as exc:
+            import traceback
+            result['err'] = (str(exc), traceback.format_exc())
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+    prog = sg.Window(
+        'Downloading model',
+        [[sg.Text(f"Downloading '{name}' (~{mb} MB)…", font=('Helvetica', 11))],
+         [sg.Text('This runs once; please wait.', font=('Helvetica', 9, 'italic'))]],
+        modal=True, finalize=True, disable_close=True, keep_on_top=True)
+    while t.is_alive():
+        prog.read(timeout=200)
+    prog.close()
+
+    if result.get('ok'):
+        return True
+    err, tb = result.get('err', ('unknown error', ''))
+    show_error(f"Model download failed:\n{err}", tb=tb, title='Download failed')
+    return False
+
+
 class RecordingPlugin(Plugin):
     name = 'recording'
 
@@ -47,7 +89,15 @@ class RecordingPlugin(Plugin):
         config = ctx.get('config', {})
 
         if self._session is None:
-            from .engine import RecordingSession
+            from .engine import RecordingSession, model_needs_download, DEFAULT_MODEL
+            rec_cfg = config.get('recording', {})
+            model_path = rec_cfg.get('model_path', '')
+            model_name = rec_cfg.get('model', '') or DEFAULT_MODEL
+            # Make sure the model is fully ready BEFORE capturing audio, so the
+            # download never competes with recording (avoids audio glitches).
+            if model_needs_download(model_path, model_name):
+                if not _ensure_model(model_path, model_name):
+                    return True  # declined or failed — do not start a session
             try:
                 new_session = RecordingSession(config)
                 new_session.start()
@@ -75,13 +125,21 @@ class RecordingPlugin(Plugin):
                 prog_win.read(timeout=200)
             prog_win.close()
 
-            sg.popup_quick_message(
-                f"Recording saved.\n"
-                f"Transcript: {self._session.transcript_path}\n"
-                f"Suggestions: {self._session.suggestions_dir}",
-                auto_close_duration=4,
-                background_color='#2e7d32', text_color='white',
-            )
+            if not self._session.had_audio:
+                sg.popup(
+                    'No audio was detected during this recording.\n\n'
+                    'Check that audio is actually playing through the output '
+                    'device selected in Config → Recording (and that it is your '
+                    'current default/active output).',
+                    title='No audio detected', modal=True, keep_on_top=True)
+            else:
+                sg.popup_quick_message(
+                    f"Recording saved.\n"
+                    f"Transcript: {self._session.transcript_path}\n"
+                    f"Suggestions: {self._session.suggestions_dir}",
+                    auto_close_duration=4,
+                    background_color='#2e7d32', text_color='white',
+                )
             self._session = None
             window[_REC_KEY].update('⏺ Record', disabled=False,
                                     button_color=('white', '#5a1a1a'))
@@ -108,10 +166,16 @@ class RecordingPlugin(Plugin):
                          font=('Helvetica', 9, 'italic'))],
             ]
 
+        from .engine import AVAILABLE_MODELS, DEFAULT_MODEL, model_needs_download
         rec = config.get('recording', {})
         keywords = list(rec.get('keywords', ['', '', '']))
         while len(keywords) < 3:
             keywords.append('')
+
+        cur_model = rec.get('model', DEFAULT_MODEL) or DEFAULT_MODEL
+        cur_path = rec.get('model_path', '')
+        model_status = ('✓ downloaded' if not model_needs_download(cur_path, cur_model)
+                        else 'not downloaded — click Download / Prepare')
 
         W_LBL, W_IN = 20, 26
         lang_tip = ('Multi-language support is not yet implemented — '
@@ -132,16 +196,30 @@ class RecordingPlugin(Plugin):
                       default_value='English', key='-REC-language-',
                       size=(W_IN - 2, 1), readonly=True, disabled=True,
                       tooltip=lang_tip)],
+            [sg.Text('Model size', size=(W_LBL, 1)),
+             sg.Combo(AVAILABLE_MODELS, default_value=cur_model, key='-REC-model-',
+                      size=(W_IN - 10, 1), readonly=True),
+             sg.Button('Download / Prepare', key='-REC-DLMODEL-', size=(16, 1))],
+            [sg.Text('', size=(W_LBL, 1)),
+             sg.Text(model_status, key='-REC-MODEL-STATUS-', font=('Helvetica', 8))],
+            [sg.Text('Custom model path', size=(W_LBL, 1)),
+             sg.Input(cur_path, key='-REC-model_path-', size=(W_IN, 1),
+                      tooltip='Folder path to a local CTranslate2 Whisper model. '
+                              'Leave blank to use the size picker above.'),
+             sg.Button('Browse', key='-REC-BROWSE-MODELPATH-', size=(7, 1))],
+            [sg.Text('', size=(W_LBL, 1)),
+             sg.Text('Optional — overrides the size picker and runs fully offline '
+                     '(no download).', font=('Helvetica', 8))],
             [sg.HSep()],
             [sg.Text('Paths', font=('Helvetica', 10, 'bold'))],
             [sg.Text('Transcript directory', size=(W_LBL, 1)),
              sg.Input(rec.get('transcript_dir', '~/.jiramaxx/transcripts'),
                       key='-REC-transcript_dir-', size=(W_IN, 1)),
-             sg.FolderBrowse('Browse', target='-REC-transcript_dir-', size=(7, 1))],
+             sg.Button('Browse', key='-REC-BROWSE-TRANSCRIPT-', size=(7, 1))],
             [sg.Text('Suggestions directory', size=(W_LBL, 1)),
              sg.Input(rec.get('suggestions_dir', '~/.jiramaxx/suggestions'),
                       key='-REC-suggestions_dir-', size=(W_IN, 1)),
-             sg.FolderBrowse('Browse', target='-REC-suggestions_dir-', size=(7, 1))],
+             sg.Button('Browse', key='-REC-BROWSE-SUGGESTIONS-', size=(7, 1))],
             [sg.HSep()],
             [sg.Text('Keyword triggers  (up to 3 — saves surrounding 30s chunks as suggestions)',
                      font=('Helvetica', 10, 'bold'))],
@@ -150,7 +228,97 @@ class RecordingPlugin(Plugin):
               for i in range(3)],
         ]
 
+    _FOLDER_BROWSE_TARGETS = {
+        '-REC-BROWSE-MODELPATH-':   '-REC-model_path-',
+        '-REC-BROWSE-TRANSCRIPT-':  '-REC-transcript_dir-',
+        '-REC-BROWSE-SUGGESTIONS-': '-REC-suggestions_dir-',
+    }
+
+    @staticmethod
+    def _subdirs(path: str) -> list:
+        import os
+        try:
+            subs = sorted((d for d in os.listdir(path)
+                           if os.path.isdir(os.path.join(path, d))), key=str.lower)
+        except OSError:
+            subs = []
+        return ['..'] + subs
+
+    def _pick_folder(self, window, target_key: str, current: str) -> None:
+        """In-app folder picker (a PySimpleGUI window, NOT the native OS dialog).
+        tkinter's askdirectory deadlocks in this app — its modal loop conflicts
+        with the global keyboard hotkey hook — which is the same reason the audio
+        device browser is hand-rolled. This avoids the native dialog entirely."""
+        import os
+        start = os.path.expanduser(current.strip()) if current.strip() else os.path.expanduser('~')
+        cur = os.path.abspath(start if os.path.isdir(start) else os.path.expanduser('~'))
+
+        layout = [
+            [sg.Text('Current folder:', font=('Helvetica', 9, 'bold'))],
+            [sg.Text(cur, key='-CURP-', size=(62, 1))],
+            [sg.Listbox(self._subdirs(cur), size=(64, 14), key='-DIRS-',
+                        enable_events=True, select_mode='single')],
+            [sg.Text('Or type a path:'),
+             sg.Input(cur, key='-MANUAL-', size=(48, 1)),
+             sg.Button('Go', key='-GO-')],
+            [sg.Push(),
+             sg.Button('Select This Folder', key='-PICK-'),
+             sg.Button('Cancel', key='-CANCEL-')],
+        ]
+        win = sg.Window('Select folder', layout, modal=True, finalize=True)
+        win.bind('<Escape>', '-CANCEL-')
+        bring_to_front(win)
+
+        chosen = None
+        while True:
+            ev, vals = safe_read(win)
+            if ev in (sg.WIN_CLOSED, '-CANCEL-'):
+                break
+            if ev == '-DIRS-' and vals.get('-DIRS-'):
+                sel = vals['-DIRS-'][0]
+                cur = os.path.abspath(os.path.dirname(cur) if sel == '..'
+                                      else os.path.join(cur, sel))
+                win['-CURP-'].update(cur)
+                win['-MANUAL-'].update(cur)
+                win['-DIRS-'].update(self._subdirs(cur))
+            elif ev == '-GO-':
+                p = os.path.expanduser(vals.get('-MANUAL-', '').strip())
+                if p and os.path.isdir(p):
+                    cur = os.path.abspath(p)
+                    win['-CURP-'].update(cur)
+                    win['-DIRS-'].update(self._subdirs(cur))
+                else:
+                    sg.popup('Not a folder.', keep_on_top=True)
+            elif ev == '-PICK-':
+                chosen = cur
+                break
+        win.close()
+        if chosen:
+            window[target_key].update(os.path.normpath(chosen))
+
     def handle_config_event(self, event, values, window, working: dict) -> bool:
+        if event in self._FOLDER_BROWSE_TARGETS:
+            target = self._FOLDER_BROWSE_TARGETS[event]
+            self._pick_folder(window, target, values.get(target, ''))
+            return True
+
+        if event == '-REC-DLMODEL-':
+            from .engine import model_needs_download, DEFAULT_MODEL
+            model_path = values.get('-REC-model_path-', '').strip()
+            model_name = values.get('-REC-model-', '') or DEFAULT_MODEL
+            if model_path:
+                sg.popup('A custom model path is set, so nothing is downloaded — '
+                         'the local model is used directly.',
+                         title='Local model', modal=True, keep_on_top=True)
+                window['-REC-MODEL-STATUS-'].update('using local model path')
+            elif not model_needs_download(model_path, model_name):
+                sg.popup(f"Model '{model_name}' is already downloaded.",
+                         title='Already downloaded', modal=True, keep_on_top=True)
+                window['-REC-MODEL-STATUS-'].update('✓ downloaded')
+            elif _ensure_model(model_path, model_name):
+                window['-REC-MODEL-STATUS-'].update('✓ downloaded')
+            return True
+
         if event not in ('-BROWSE-INPUT-', '-BROWSE-LOOPBACK-'):
             return False
         from .engine import list_devices
@@ -183,15 +351,14 @@ class RecordingPlugin(Plugin):
     def collect_config(self, values, working: dict) -> None:
         if _DISABLED_BY_ENV:
             return
-        existing = working.get('recording', {})
+        from .engine import DEFAULT_MODEL
         section = {
             'input_device':    values.get('-REC-input_device-', ''),
             'loopback_device': values.get('-REC-loopback_device-', ''),
+            'model':           values.get('-REC-model-', '') or DEFAULT_MODEL,
+            'model_path':      values.get('-REC-model_path-', '').strip(),
             'transcript_dir':  values.get('-REC-transcript_dir-', '~/.jiramaxx/transcripts'),
             'suggestions_dir': values.get('-REC-suggestions_dir-', '~/.jiramaxx/suggestions'),
             'keywords':        [values.get(f'-REC-keyword{i}-', '') for i in range(3)],
         }
-        # Preserve a manually-set local model path override if present.
-        if existing.get('model_path'):
-            section['model_path'] = existing['model_path']
         working['recording'] = section

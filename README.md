@@ -333,7 +333,7 @@ Open **Config → Network** to configure these, or edit the `network` section of
 **Other things that can bite on a locked-down network:**
 - **Egress allowlists** must permit `*.atlassian.net` and `api.atlassian.com`.
 - **Authenticated proxies (NTLM/Kerberos)** and **PAC auto-config** are not handled directly — set `HTTP_PROXY` / `HTTPS_PROXY` yourself (with inline credentials if your proxy needs them), or run a local proxy bridge.
-- **Recording** ships its Whisper model inside the `jiramaxx-recording` package and transcribes fully offline, so it needs no network access at runtime.
+- **Recording** transcribes locally on the CPU — audio/text never leave the machine — but it downloads its Whisper model (~145 MB) from Hugging Face on first use, then runs offline. On a locked-down network, allow that one-time download, or pre-fetch the model for an air-gapped install (see the `jiramaxx-recording` README).
 
 ---
 
