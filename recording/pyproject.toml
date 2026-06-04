@@ -9,11 +9,11 @@ homepage = "https://github.com/doctoptogonopus/jiramaxx"
 repository = "https://github.com/doctoptogonopus/jiramaxx"
 keywords = ["jira", "recording", "transcription", "whisper", "plugin"]
 packages = [{include = "jiramaxx_recording"}]
-# Bundle the pre-converted Whisper model into the wheel so recording works
-# fully offline with no first-run download. This makes the wheel ~150 MB, which
-# is why it lives on an internal/corporate mirror (public PyPI caps files at
-# 100 MB by default).
-include = [{ path = "jiramaxx_recording/models/**/*", format = ["sdist", "wheel"] }]
+# The Whisper model is NOT packed into the wheel — faster-whisper downloads it
+# once from Hugging Face on first use, then runs offline. This keeps the wheel
+# small (publishable on public PyPI). For an air-gapped/offline build you can
+# pre-fetch the model with scripts/fetch_model.py and add an `include` for
+# jiramaxx_recording/models/**/* before building.
 
 [tool.poetry.dependencies]
 python = ">=3.10"

@@ -19,13 +19,36 @@ There is **no separate command** — the app is still launched with `jiramaxx`.
 Once this package is installed, core discovers it via the `jiramaxx.plugins`
 entry point and adds a Record button (main window) and a Recording tab (config).
 
+## Choosing / downloading the model
+
+Open **Config → Recording → Transcription**:
+
+- **Model size** — pick `tiny.en` / `base.en` (default) / `small.en` /
+  `medium.en` / `large-v3`. Larger = more accurate but slower and a bigger
+  download.
+- **Download / Prepare model** — explicitly downloads the selected model from
+  Hugging Face (with a confirmation prompt) and loads it, so recording starts
+  instantly afterward. **Nothing is downloaded automatically** — only when you
+  click this button, or when you confirm the prompt the first time you hit
+  Record. If you never do either, nothing is ever fetched.
+- **Custom model path** (optional) — point at a local CTranslate2 Whisper model
+  directory. This **overrides** the size picker and runs fully offline (no
+  download), e.g. for air-gapped installs.
+
+When you click **Record** and the chosen model isn't downloaded yet, you're asked
+to confirm the download; recording does **not** start until it completes, so the
+download never competes with audio capture.
+
 ## Offline / privacy
 
 Transcription runs entirely on the local CPU via faster-whisper — **no audio or
-text ever leaves the machine**. The Whisper model is bundled inside the wheel
-and loaded with `local_files_only` + `HF_HUB_OFFLINE`, so there are **no network
-calls at runtime**. (See `scripts/fetch_model.py` for how the model is fetched
-at *build* time.)
+text ever leaves the machine**. The only network activity is the one-time,
+read-only download of the public Whisper weights described above; after that the
+cached model loads offline.
+
+For a fully air-gapped install, set a **Custom model path**, or pre-fetch the
+default with `scripts/fetch_model.py` into `jiramaxx_recording/models/base.en/`
+(loaded directly with no download).
 
 ## Disabling via policy
 

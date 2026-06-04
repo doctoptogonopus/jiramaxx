@@ -1,15 +1,18 @@
 """
-Developer/build helper: pre-download the faster-whisper `base.en` model into
-`jiramaxx_recording/models/base.en/` so it can be bundled into the wheel.
+OPTIONAL helper for air-gapped/offline builds: pre-download the faster-whisper
+`base.en` model into `jiramaxx_recording/models/base.en/`.
 
-Run ONCE before building the package (not at install time):
+The default build does NOT use this — end users download the model from
+HuggingFace on first use and run offline thereafter (see
+engine._resolve_model_source). Run this only when you want a self-contained
+offline install:
 
     python scripts/fetch_model.py
 
-This requires network access to HuggingFace *at build time only*. End users
-never download anything — the model ships inside the wheel and is loaded
-offline (see engine._resolve_model_source). The model files are large (~145 MB);
-keep them out of normal git history (use git-lfs or fetch-before-build in CI).
+It downloads `base.en` (~145 MB) so the engine can load it directly with no
+network calls. To actually ship it inside the wheel, also add an `include` for
+`jiramaxx_recording/models/**/*` to pyproject.toml before building. The model
+files are large; keep them out of normal git history (git-lfs or fetch-in-CI).
 """
 from __future__ import annotations
 import shutil

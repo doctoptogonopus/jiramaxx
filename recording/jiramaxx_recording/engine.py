@@ -3,13 +3,16 @@ Audio capture + local transcription engine.
 
 Captures system audio (loopback) plus an optional microphone, mixes them, and
 transcribes in 30-second chunks with faster-whisper. Transcription runs entirely
-on the local CPU — no audio or text ever leaves the machine. The only resource
-the Whisper library would otherwise fetch over the network is the model file
-itself; we ship that inside the package (``models/base.en``) and load it from
-disk with ``local_files_only`` + ``HF_HUB_OFFLINE`` so runtime is fully offline.
+on the local CPU — no audio or text ever leaves the machine. The only network
+activity is a one-time, read-only download of the public Whisper weights
+(``base.en``) from Hugging Face on first use; thereafter the cached model loads
+offline. An explicitly configured ``model_path`` or a model pre-placed under
+``models/base.en`` is used directly (no download). See ``model_needs_download``.
 """
 from __future__ import annotations
 import os
+import time
+import warnings
 import threading
 import queue
 from pathlib import Path
@@ -23,30 +26,89 @@ CHUNK_SECONDS = 30
 _SUB_SECONDS = 1
 _AUDIO_Q_MAX = 20  # caps in-flight audio at ~38MB if transcription falls behind
 
+# Whisper sizes the user can pick (faster-whisper resolves these to the
+# Systran/faster-whisper-<name> repos). English-only variants are listed since
+# transcription is locked to English; large-v3 has no .en variant.
+DEFAULT_MODEL = 'base.en'
+AVAILABLE_MODELS = ['tiny.en', 'base.en', 'small.en', 'medium.en', 'large-v3']
+# Rough on-disk/download sizes (MB) for confirmation prompts — not exact.
+_MODEL_APPROX_MB = {
+    'tiny.en': 75, 'base.en': 145, 'small.en': 480,
+    'medium.en': 1500, 'large-v3': 3090,
+}
+
 _model_lock = threading.Lock()
 _whisper_model = None
 _whisper_lang_loaded: str | None = None
+_whisper_key_loaded: tuple | None = None  # (model_name, resolved_source)
+
+# WASAPI loopback capture emits "data discontinuity" warnings while the stream
+# primes (first moment of a recording). They're benign startup noise, so we
+# swallow *only that message* for a short warmup window after each start — any
+# later discontinuity (which can signal real dropped audio) still surfaces.
+_DISCONTINUITY_WARMUP_SEC = 1.0
+_warmup_until = 0.0
+_filter_installed = False
 
 
-def _resolve_model_source(model_path: str = '') -> tuple[str, bool]:
-    """Return (source, local_only). Prefers an explicit path, then the bundled
-    model, then the plain name (which permits a one-time download for dev/
-    non-air-gapped installs)."""
+def _install_discontinuity_filter() -> None:
+    """Install a one-time warnings hook that drops the soundcard 'data
+    discontinuity' message during the post-start warmup window only."""
+    global _filter_installed
+    if _filter_installed:
+        return
+    orig = warnings.showwarning
+
+    def _showwarning(message, category, filename, lineno, file=None, line=None):
+        if time.monotonic() < _warmup_until and 'discontinuity' in str(message):
+            return  # expected stream-priming glitch at recording start
+        orig(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = _showwarning
+    _filter_installed = True
+
+
+def _resolve_model_source(model_path: str = '',
+                          model_name: str = DEFAULT_MODEL) -> tuple[str, bool]:
+    """Return (source, local_only). Prefers an explicit path, then a bundled
+    model of the requested size, then the plain size name (which permits a
+    one-time download for non-air-gapped installs)."""
     if model_path:
         return os.path.expanduser(model_path), True
-    bundled = Path(__file__).parent / 'models' / 'base.en'
+    bundled = Path(__file__).parent / 'models' / (model_name or DEFAULT_MODEL)
     if bundled.exists():
         return str(bundled), True
-    return 'base.en', False
+    return (model_name or DEFAULT_MODEL), False
 
 
-def _load_model(language: str = 'en', model_path: str = ''):
-    """Load (and cache) the faster-whisper model from the bundled/local files."""
-    global _whisper_model, _whisper_lang_loaded
+def model_needs_download(model_path: str = '',
+                         model_name: str = DEFAULT_MODEL) -> bool:
+    """True if loading the model would hit the network (i.e. it's neither at an
+    explicit path, nor bundled, nor already in the Hugging Face cache). Used to
+    decide whether to prompt for / show a download before recording starts."""
+    _source, local_only = _resolve_model_source(model_path, model_name)
+    if local_only:
+        return False
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        repo = f'Systran/faster-whisper-{model_name or DEFAULT_MODEL}'
+        hit = try_to_load_from_cache(repo, 'model.bin')
+    except Exception:
+        return True  # can't tell — assume a download so the user is warned
+    return not isinstance(hit, str)
+
+
+def _load_model(language: str = 'en', model_path: str = '',
+                model_name: str = DEFAULT_MODEL):
+    """Load (and cache) the faster-whisper model. Reloads if the requested
+    model/source changes; downloads on first use when not local/bundled."""
+    global _whisper_model, _whisper_lang_loaded, _whisper_key_loaded
     with _model_lock:
-        if _whisper_model is None or _whisper_lang_loaded != language:
+        source, local_only = _resolve_model_source(model_path, model_name)
+        key = (model_name or DEFAULT_MODEL, source)
+        if (_whisper_model is None or _whisper_lang_loaded != language
+                or _whisper_key_loaded != key):
             from faster_whisper import WhisperModel
-            source, local_only = _resolve_model_source(model_path)
             if local_only:
                 # Guarantee zero network calls at runtime (not even an update ping).
                 os.environ.setdefault('HF_HUB_OFFLINE', '1')
@@ -54,7 +116,16 @@ def _load_model(language: str = 'en', model_path: str = ''):
                 source, device='cpu', compute_type='int8',
                 local_files_only=local_only)
             _whisper_lang_loaded = language
+            _whisper_key_loaded = key
         return _whisper_model
+
+
+def prepare_model(model_path: str = '', model_name: str = DEFAULT_MODEL) -> None:
+    """Download (if needed) and load the selected model so a later recording
+    reuses it with no download. Only ever called from an explicit user action
+    (the Download/Prepare button or a confirmed download prompt). Raises on
+    failure (e.g. no network)."""
+    _load_model('en', model_path, model_name)
 
 
 def _round_to_30min(dt: datetime) -> datetime:
@@ -132,12 +203,14 @@ class RecordingSession:
     def __init__(self, config: dict):
         self._cfg = config.get('recording', {})
         self._model_path = self._cfg.get('model_path', '')
+        self._model_name = self._cfg.get('model', DEFAULT_MODEL) or DEFAULT_MODEL
         self._stop_event = threading.Event()
         self._audio_q: queue.Queue = queue.Queue(maxsize=_AUDIO_Q_MAX)
         self._start_time = datetime.now()
         self._recorders: list[_DeviceRecorder] = []
         self._mix_thread: threading.Thread | None = None
         self._tx_thread: threading.Thread | None = None
+        self._had_audio = False  # set once any chunk carries real signal
 
         transcript_dir = Path(
             self._cfg.get('transcript_dir', '~/.jiramaxx/transcripts')
@@ -179,6 +252,13 @@ class RecordingSession:
             if in_dev is None:
                 raise RuntimeError(f"Configured input device not found: {in_name}")
 
+        # Arm the warmup filter before touching the devices, so the stream-
+        # priming "data discontinuity" warnings (pre-flight + the first moment of
+        # capture) are swallowed for ~1s while everything spins up.
+        global _warmup_until
+        _install_discontinuity_filter()
+        _warmup_until = time.monotonic() + _DISCONTINUITY_WARMUP_SEC
+
         # Pre-flight: open each device briefly so failures surface immediately
         # instead of being silently swallowed inside a background thread.
         for label, dev in [('loopback', lb_dev), ('input', in_dev)]:
@@ -200,8 +280,10 @@ class RecordingSession:
             r.start()
 
         # Prewarm whisper so the first chunk doesn't pay the model-load cost.
+        # (By design recording only starts once the model is ready, so this is a
+        # fast in-memory load, not a download.)
         threading.Thread(target=_load_model,
-                         args=(self._language(), self._model_path),
+                         args=(self._language(), self._model_path, self._model_name),
                          daemon=True).start()
 
         self._mix_thread = threading.Thread(target=self._mix_loop, daemon=True)
@@ -229,6 +311,11 @@ class RecordingSession:
     @property
     def is_transcribing(self) -> bool:
         return self._tx_thread is not None and self._tx_thread.is_alive()
+
+    @property
+    def had_audio(self) -> bool:
+        """True if any captured chunk carried real signal (not pure silence)."""
+        return self._had_audio
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -260,6 +347,8 @@ class RecordingSession:
                     continue
                 min_len = min(len(c) for c in chunks)
                 mixed = np.mean([c[:min_len] for c in chunks], axis=0)
+                if not self._had_audio and np.abs(mixed).max() > 0.005:
+                    self._had_audio = True  # real signal, not silence
                 buffer.append(mixed)
                 frames_collected += len(mixed)
                 if frames_collected >= chunk_frames:
@@ -277,7 +366,7 @@ class RecordingSession:
             self._audio_q.put(None)  # sentinel for transcribe loop
 
     def _transcribe_loop(self):
-        model = _load_model(self._language(), self._model_path)
+        model = _load_model(self._language(), self._model_path, self._model_name)
         pending_chunks: list[str] = []
         chunks_after = 0  # countdown of follow-up chunks needed since last keyword
 
@@ -289,7 +378,8 @@ class RecordingSession:
                 break
 
             segments, _ = model.transcribe(chunk, beam_size=5,
-                                           language=self._language())
+                                           language=self._language(),
+                                           vad_filter=True)
             text = ' '.join(s.text.strip() for s in segments).strip()
 
             if not text:
