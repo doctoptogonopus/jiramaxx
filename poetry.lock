@@ -663,24 +663,22 @@ all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
 [[package]]
 name = "jiramaxx-recording"
-version = "0.1.0"
+version = "1.0.0"
 description = "Optional meeting-recording + local transcription plugin for jiramaxx"
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "extra == \"recording\""
-files = []
-develop = true
+files = [
+    {file = "jiramaxx_recording-1.0.0-py3-none-any.whl", hash = "sha256:44de5c00a2f46edcec85d811982e945d67010a523a8d68bfae9f9bada58a1757"},
+    {file = "jiramaxx_recording-1.0.0.tar.gz", hash = "sha256:6db4e7a804fda7a992e24298771c1dd363ee6ed7a4bdadd6b3c9716cb5b6c4b6"},
+]
 
 [package.dependencies]
 faster-whisper = ">=1.0.0"
-jiramaxx = ">=0.1.0"
+jiramaxx = ">=1.0.0"
 numpy = ">=1.24"
 soundcard = ">=0.4.2"
-
-[package.source]
-type = "directory"
-url = "recording"
 
 [[package]]
 name = "keyboard"
@@ -4809,4 +4807,4 @@ recording = ["jiramaxx-recording"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10"
-content-hash = "749494454ad49718eb92696f9768156d6a22cb7b0f0d5fa5f75e629e5d0d147c"
+content-hash = "0a3bef4834eb3711ccd023bf85d8a0dd5af3bead12a854ff4399bd98efa8192d"
