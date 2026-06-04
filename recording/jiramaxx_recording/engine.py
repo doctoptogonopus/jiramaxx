@@ -1,3 +1,13 @@
+"""
+Audio capture + local transcription engine.
+
+Captures system audio (loopback) plus an optional microphone, mixes them, and
+transcribes in 30-second chunks with faster-whisper. Transcription runs entirely
+on the local CPU — no audio or text ever leaves the machine. The only resource
+the Whisper library would otherwise fetch over the network is the model file
+itself; we ship that inside the package (``models/base.en``) and load it from
+disk with ``local_files_only`` + ``HF_HUB_OFFLINE`` so runtime is fully offline.
+"""
 from __future__ import annotations
 import os
 import threading
@@ -5,23 +15,8 @@ import queue
 from pathlib import Path
 from datetime import datetime
 
-# Corporate kill switch. Set JIRAMAXX_DISABLE_RECORDING=1 in the system or
-# user environment (e.g. via group policy) to force-disable the recording
-# capability even if soundcard / faster-whisper happen to be importable.
-_DISABLED_BY_ENV = os.environ.get('JIRAMAXX_DISABLE_RECORDING', '').strip().lower() in (
-    '1', 'true', 'yes', 'on'
-)
-
-if _DISABLED_BY_ENV:
-    RECORDING_AVAILABLE = False
-else:
-    try:
-        import numpy as np
-        import soundcard as sc
-        from faster_whisper import WhisperModel  # noqa: F401 — import check only
-        RECORDING_AVAILABLE = True
-    except ImportError:
-        RECORDING_AVAILABLE = False
+import numpy as np
+import soundcard as sc
 
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 30
@@ -33,14 +28,31 @@ _whisper_model = None
 _whisper_lang_loaded: str | None = None
 
 
-def _load_model(language: str = 'en'):
-    """Load (and cache) the faster-whisper model. Uses .en variant for English."""
+def _resolve_model_source(model_path: str = '') -> tuple[str, bool]:
+    """Return (source, local_only). Prefers an explicit path, then the bundled
+    model, then the plain name (which permits a one-time download for dev/
+    non-air-gapped installs)."""
+    if model_path:
+        return os.path.expanduser(model_path), True
+    bundled = Path(__file__).parent / 'models' / 'base.en'
+    if bundled.exists():
+        return str(bundled), True
+    return 'base.en', False
+
+
+def _load_model(language: str = 'en', model_path: str = ''):
+    """Load (and cache) the faster-whisper model from the bundled/local files."""
     global _whisper_model, _whisper_lang_loaded
     with _model_lock:
         if _whisper_model is None or _whisper_lang_loaded != language:
             from faster_whisper import WhisperModel
-            model_name = 'base.en' if language == 'en' else 'base'
-            _whisper_model = WhisperModel(model_name, device='cpu', compute_type='int8')
+            source, local_only = _resolve_model_source(model_path)
+            if local_only:
+                # Guarantee zero network calls at runtime (not even an update ping).
+                os.environ.setdefault('HF_HUB_OFFLINE', '1')
+            _whisper_model = WhisperModel(
+                source, device='cpu', compute_type='int8',
+                local_files_only=local_only)
             _whisper_lang_loaded = language
         return _whisper_model
 
@@ -66,9 +78,7 @@ def _session_folder(start_time: datetime, base_dir: Path) -> Path:
 
 
 def list_devices() -> tuple[list[str], list[str]]:
-    """Return (loopback_device_names, input_device_names). Requires recording extra."""
-    if not RECORDING_AVAILABLE:
-        return [], []
+    """Return (loopback_device_names, input_device_names)."""
     all_mics = sc.all_microphones(include_loopback=True)
     loopbacks, inputs = [], []
     for m in all_mics:
@@ -121,6 +131,7 @@ class RecordingSession:
 
     def __init__(self, config: dict):
         self._cfg = config.get('recording', {})
+        self._model_path = self._cfg.get('model_path', '')
         self._stop_event = threading.Event()
         self._audio_q: queue.Queue = queue.Queue(maxsize=_AUDIO_Q_MAX)
         self._start_time = datetime.now()
@@ -189,7 +200,8 @@ class RecordingSession:
             r.start()
 
         # Prewarm whisper so the first chunk doesn't pay the model-load cost.
-        threading.Thread(target=_load_model, args=(self._language(),),
+        threading.Thread(target=_load_model,
+                         args=(self._language(), self._model_path),
                          daemon=True).start()
 
         self._mix_thread = threading.Thread(target=self._mix_loop, daemon=True)
@@ -265,7 +277,7 @@ class RecordingSession:
             self._audio_q.put(None)  # sentinel for transcribe loop
 
     def _transcribe_loop(self):
-        model = _load_model(self._language())
+        model = _load_model(self._language(), self._model_path)
         pending_chunks: list[str] = []
         chunks_after = 0  # countdown of follow-up chunks needed since last keyword
 

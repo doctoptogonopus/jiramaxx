@@ -662,6 +662,27 @@ files = [
 all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
 [[package]]
+name = "jiramaxx-recording"
+version = "0.1.0"
+description = "Optional meeting-recording + local transcription plugin for jiramaxx"
+optional = true
+python-versions = ">=3.10"
+groups = ["main"]
+markers = "extra == \"recording\""
+files = []
+develop = true
+
+[package.dependencies]
+faster-whisper = ">=1.0.0"
+jiramaxx = ">=0.1.0"
+numpy = ">=1.24"
+soundcard = ">=0.4.2"
+
+[package.source]
+type = "directory"
+url = "recording"
+
+[[package]]
 name = "keyboard"
 version = "0.13.5"
 description = "Hook and simulate keyboard events on Windows and Linux"
@@ -4721,6 +4742,18 @@ slack = ["slack-sdk"]
 telegram = ["requests"]
 
 [[package]]
+name = "truststore"
+version = "0.10.4"
+description = "Verify certificates using native system trust stores"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981"},
+    {file = "truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301"},
+]
+
+[[package]]
 name = "typer"
 version = "0.25.1"
 description = "Typer, build great CLIs. Easy to code. Based on Python type hints."
@@ -4771,9 +4804,9 @@ socks = ["pysocks (>=1.5.6,!=1.5.7,<2.0)"]
 zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [extras]
-recording = ["faster-whisper", "soundcard"]
+recording = ["jiramaxx-recording"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10"
-content-hash = "fc8a93bb1dfceaae8f5a56d44b44b960302ed50f4464e603a66d6fbd74829353"
+content-hash = "749494454ad49718eb92696f9768156d6a22cb7b0f0d5fa5f75e629e5d0d147c"

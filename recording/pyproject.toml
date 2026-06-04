@@ -1,0 +1,34 @@
+[tool.poetry]
+name = "jiramaxx-recording"
+version = "0.1.0"
+description = "Optional meeting-recording + local transcription plugin for jiramaxx"
+authors = []
+readme = "README.md"
+license = "MIT"
+homepage = "https://github.com/doctoptogonopus/jiramaxx"
+repository = "https://github.com/doctoptogonopus/jiramaxx"
+keywords = ["jira", "recording", "transcription", "whisper", "plugin"]
+packages = [{include = "jiramaxx_recording"}]
+# Bundle the pre-converted Whisper model into the wheel so recording works
+# fully offline with no first-run download. This makes the wheel ~150 MB, which
+# is why it lives on an internal/corporate mirror (public PyPI caps files at
+# 100 MB by default).
+include = [{ path = "jiramaxx_recording/models/**/*", format = ["sdist", "wheel"] }]
+
+[tool.poetry.dependencies]
+python = ">=3.10"
+# Depends on core: installing the plugin guarantees the host app is present.
+# The reverse is NOT true — core never depends on this package.
+jiramaxx = ">=0.1.0"
+soundcard = ">=0.4.2"
+faster-whisper = ">=1.0.0"
+numpy = ">=1.24"
+
+# This is the socket core looks for. When this package is installed, core
+# discovers RecordingPlugin and renders the Record button + Recording tab.
+[tool.poetry.plugins."jiramaxx.plugins"]
+recording = "jiramaxx_recording.plugin:RecordingPlugin"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

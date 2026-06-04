@@ -10,6 +10,7 @@ Usage:
 """
 from __future__ import annotations
 import queue
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -18,12 +19,16 @@ import yaml
 import PySimpleGUI as sg
 import keyboard
 
-from .api import JiraClient
+from .api import JiraClient, apply_proxy_env
 from .cache import Cache
 from .models import init_ticket_config, init_jira_config
 from .ui import run_main_window, show_interaction_window
 
-CONFIG_PATH = Path(__file__).parent / 'config.yaml'
+# Config lives in the user's home directory, not inside the installed package —
+# site-packages is often read-only (and shared) for pip installs, and credentials
+# do not belong there. The legacy in-package location is migrated on first run.
+CONFIG_PATH = Path.home() / '.jiramaxx' / 'config.yaml'
+LEGACY_CONFIG_PATH = Path(__file__).parent / 'config.yaml'
 
 DEFAULT_CONFIG: dict = {
     'jira': {
@@ -41,14 +46,41 @@ DEFAULT_CONFIG: dict = {
         'create_ticket': 'ctrl+alt+j',
         'manage_tickets': 'ctrl+alt+m',
     },
+    'network': {
+        'use_system_certs': True,
+        'ca_bundle': '',
+        'proxy': '',
+    },
 }
 
 
+def enable_system_certs(config: dict) -> None:
+    """Verify TLS against the OS trust store so corporate root CAs that IT
+    installed system-wide are honored (requests' bundled certifi list ignores
+    the Windows store). Defensive: any failure falls back to default behavior,
+    so home users are unaffected. Honors network.use_system_certs to opt out."""
+    if not config.get('network', {}).get('use_system_certs', True):
+        return
+    try:
+        import truststore
+        truststore.inject_into_ssl()
+    except Exception:
+        pass
+
+
 def load_config() -> dict:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
-        with open(CONFIG_PATH, 'w') as f:
-            yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False)
-        return dict(DEFAULT_CONFIG)
+        # One-time migration from the old in-package location, if present.
+        if LEGACY_CONFIG_PATH.exists() and LEGACY_CONFIG_PATH != CONFIG_PATH:
+            try:
+                shutil.copyfile(LEGACY_CONFIG_PATH, CONFIG_PATH)
+            except OSError:
+                pass
+        if not CONFIG_PATH.exists():
+            with open(CONFIG_PATH, 'w') as f:
+                yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False)
+            return dict(DEFAULT_CONFIG)
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
 
@@ -74,19 +106,14 @@ def _prompt_setup(config: dict) -> dict:
 
 def build_clients(config: dict) -> tuple[Cache, JiraClient]:
     cache = Cache(config.get('cache', {}).get('directory', '~/.jira_tool/cache'))
-    jcfg = config['jira']
-    jira = JiraClient(
-        jcfg['base_url'],
-        jcfg.get('user_email', ''),
-        jcfg.get('api_token', ''),
-        token_type=jcfg.get('token_type', 'classic'),
-        cloud_id=jcfg.get('cloud_id', ''),
-    )
+    jira = JiraClient.from_config(config)
     return cache, jira
 
 
 def main():
     config = load_config()
+    enable_system_certs(config)
+    apply_proxy_env(config.get('network', {}))
     sg.theme(config.get('ui', {}).get('theme', 'DarkBlue3'))
     init_ticket_config(config.get('ticket_types', {}))
     init_jira_config(config.get('jira', {}))
@@ -119,7 +146,7 @@ def main():
 
             try:
                 if action == 'main':
-                    run_main_window(cache, jira, config)
+                    run_main_window(cache, jira, config, CONFIG_PATH)
                 elif action == 'manage':
                     show_interaction_window(jira, config)
             finally:
@@ -131,6 +158,8 @@ def main():
 
 if __name__ == '__main__':
     config = load_config()
+    enable_system_certs(config)
+    apply_proxy_env(config.get('network', {}))
     sg.theme(config.get('ui', {}).get('theme', 'DarkBlue3'))
 
     if '--gui' in sys.argv:
