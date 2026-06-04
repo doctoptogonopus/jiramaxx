@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "jiramaxx-recording"
-version = "0.1.0"
+version = "1.0.0"
 description = "Optional meeting-recording + local transcription plugin for jiramaxx"
-authors = []
+authors = ["doctoptogonopus"]
 readme = "README.md"
 license = "MIT"
 homepage = "https://github.com/doctoptogonopus/jiramaxx"
@@ -19,7 +19,7 @@ packages = [{include = "jiramaxx_recording"}]
 python = ">=3.10"
 # Depends on core: installing the plugin guarantees the host app is present.
 # The reverse is NOT true — core never depends on this package.
-jiramaxx = ">=0.1.0"
+jiramaxx = ">=1.0.0"
 soundcard = ">=0.4.2"
 faster-whisper = ">=1.0.0"
 numpy = ">=1.24"
