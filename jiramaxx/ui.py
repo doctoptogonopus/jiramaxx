@@ -5,6 +5,7 @@ from .cache import Cache
 from .api import JiraClient
 import traceback as _tb
 from .utils import safe_read as _read, show_error, bring_to_front
+from .plugins import discover_plugins
 
 _LABEL_W = 22
 _INPUT_W = 42
@@ -13,6 +14,19 @@ _MULTI_H = 5
 
 def _fkey(field_name: str) -> str:
     return f'-FIELD-{field_name.upper()}-'
+
+
+def _soft_select(window, idx: int = 0, key: str = '-LIST-') -> None:
+    """Pre-highlight a listbox row and give the list keyboard focus so arrow
+    keys navigate immediately. ``idx`` is clamped to the current row count."""
+    lst = window[key]
+    n = len(lst.get_list_values())
+    if n == 0:
+        return
+    idx = max(0, min(idx, n - 1))
+    lst.update(set_to_index=[idx])
+    lst.Widget.activate(idx)
+    lst.Widget.focus_set()
 
 
 def _build_field_row(field_name: str, ticket: Ticket) -> list:
@@ -160,7 +174,8 @@ def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
     layout = [
         [sg.Text(f'{len(drafts)} incomplete draft(s)', font=('Helvetica', 12, 'bold'))],
         [sg.Listbox(labels, size=(72, min(len(drafts) + 1, 12)),
-                    key='-LIST-', enable_events=True, select_mode=sg.LISTBOX_SELECT_MODE_SINGLE)],
+                    key='-LIST-', enable_events=False,
+                    select_mode=sg.LISTBOX_SELECT_MODE_BROWSE)],
         [sg.Push(),
          sg.Button('Open',   key='-OPEN-'),
          sg.Button('Delete', key='-DELETE-'),
@@ -171,6 +186,7 @@ def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
     window.bind('<Escape>', '-CANCEL-')
     bring_to_front(window)
     window.bind('<Return>', '-OPEN-')
+    _soft_select(window, 0)
 
     result = None
     while True:
@@ -185,7 +201,7 @@ def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
 
         if sel:
             idx = labels.index(sel[0])
-            if event in ('-OPEN-', '-LIST-'):
+            if event == '-OPEN-':
                 result = drafts[idx]
                 break
             if event == '-DELETE-':
@@ -196,6 +212,7 @@ def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
                     window['-LIST-'].update(labels)
                     if not drafts:
                         break
+                    _soft_select(window, idx)
 
     window.close()
     return result
@@ -233,9 +250,7 @@ def show_interaction_window(jira: JiraClient, config: dict):
                    ('s', '-STATUS-'),  ('S', '-STATUS-'),
                    ('x', '-CANCEL-'),  ('X', '-CANCEL-')]:
         window.bind(ch, ev)
-    window['-LIST-'].update(set_to_index=[0])
-    window['-LIST-'].Widget.activate(0)
-    window['-LIST-'].Widget.focus_set()
+    _soft_select(window, 0)
 
     while True:
         event, values = _read(window)
@@ -295,14 +310,19 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
                     config_path=None) -> dict:
     """Returns (possibly updated) config dict — may change after visiting Config."""
     from .config_ui import show_config_window
-    from pathlib import Path
     if config_path is None:
-        config_path = Path(__file__).parent / 'config.yaml'
+        from .main import CONFIG_PATH
+        config_path = CONFIG_PATH
 
     def _draft_msg(n: int) -> str:
         return f'{n} incomplete draft(s) — press D to view' if n else 'No pending drafts'
 
     drafts = cache.drafts()
+
+    plugins = discover_plugins()
+    # Plugins (e.g. jiramaxx-recording) contribute buttons here; if none are
+    # installed this row is empty and is omitted from the layout entirely.
+    plugin_buttons = [b for p in plugins for b in p.main_buttons()]
 
     layout = [
         [sg.Text('Jira Tool', font=('Helvetica', 16, 'bold'))],
@@ -315,6 +335,8 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
          sg.Button('(C) Config',         key='-CONFIG-', size=(18, 2))],
         [sg.Button('(Q) Quit',           key='-QUIT-',   size=(38, 1))],
     ]
+    if plugin_buttons:
+        layout.append([sg.Push(), *plugin_buttons])
     window = sg.Window('Jira Tool', layout, finalize=True)
     window.bind('<Escape>', '-QUIT-')
     bring_to_front(window)
@@ -326,12 +348,32 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
         window.bind(ch, ev)
 
     while True:
-        event, _ = _read(window)
+        event, values = _read(window)
 
         if event in (sg.WIN_CLOSED, '-QUIT-'):
+            for p in plugins:
+                try:
+                    p.on_main_window_close()
+                except Exception:
+                    pass
             break
 
-        if event == '-NEW-':
+        # Give plugins (e.g. recording) first crack at the event.
+        handled = False
+        for p in plugins:
+            try:
+                if p.handle_main_event(event, values, window, {'config': config}):
+                    handled = True
+                    break
+            except Exception as exc:
+                show_error(f"Plugin error:\n{exc}", tb=_tb.format_exc(),
+                           title='Plugin Error')
+                handled = True
+                break
+
+        if handled:
+            pass
+        elif event == '-NEW-':
             window.hide()
             ticket_type = show_type_selector()
             if ticket_type:
@@ -361,14 +403,7 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
             if updated:
                 config = updated
                 sg.theme(config.get('ui', {}).get('theme', 'DarkBlue3'))
-                jcfg = config.get('jira', {})
-                jira = JiraClient(
-                    jcfg.get('base_url', ''),
-                    jcfg.get('user_email', ''),
-                    jcfg.get('api_token', ''),
-                    token_type=jcfg.get('token_type', 'classic'),
-                    cloud_id=jcfg.get('cloud_id', ''),
-                )
+                jira = JiraClient.from_config(config)
                 cache = Cache(config.get('cache', {}).get('directory', '~/.jira_tool/cache'))
             window.un_hide()
             bring_to_front(window)

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Version-controlled pre-commit hook (enabled via `git config core.hooksPath .githooks`).
+# Keeps the GitHub-facing root README.md mirrored from the canonical packaged
+# README at jiramaxx/README.md. Edit jiramaxx/README.md, not the root copy.
+python scripts/sync_readme.py || python3 scripts/sync_readme.py || {
+    echo "pre-commit: could not run scripts/sync_readme.py (is python on PATH?)" >&2
+    exit 1
+}

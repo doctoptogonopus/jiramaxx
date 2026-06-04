@@ -13,6 +13,25 @@ A lightweight desktop GUI for creating and managing Jira tickets without leaving
 poetry install
 ```
 
+### Installing
+
+```
+pip install jiramaxx              # Jira tool only
+pip install jiramaxx[recording]   # also install the optional recording plugin
+```
+
+Recording lives in a **separate distribution** (`jiramaxx-recording`) so it can
+be left out of a corporate package mirror where audio capture is restricted. The
+`[recording]` extra is just a convenience alias that also installs that package;
+`pip install jiramaxx-recording` does the same thing. There is **no separate
+command** — the app is always launched with `jiramaxx`. When the recording
+package is present, a Record button and a Recording tab appear automatically;
+when it is absent, they simply don't.
+
+> In a curated mirror that carries `jiramaxx` but not `jiramaxx-recording`,
+> `pip install jiramaxx[recording]` fails cleanly (nothing is installed from an
+> unauthorized source), while plain `pip install jiramaxx` always works.
+
 ---
 
 ## Setup
@@ -25,7 +44,7 @@ OR
 jiramaxx --gui
 ```
 
-On first run with no `config.yaml`, a default one is created and the widget requires you to fill in your credentials (see below) and run again, or use the in-widget Config screen.
+On first run, a default `config.yaml` is created at **`~/.jiramaxx/config.yaml`** (your home directory — not inside the installed package). The widget requires you to fill in your credentials (see below) and run again, or use the in-widget Config screen. _If an older in-package `config.yaml` exists from a previous version, it is migrated to the new location automatically on first run._
 _If running with --gui flag, the script will stop running upon exiting rendering shortcuts unavailable._
 
 ### 2. Configure credentials
@@ -273,6 +292,11 @@ hotkeys:
   create_ticket:  ctrl+alt+j
   manage_tickets: ctrl+alt+m
 
+network:
+  use_system_certs: true   # trust OS-installed (corporate) root CAs
+  ca_bundle: ''            # optional path to a PEM bundle; overrides the above
+  proxy: ''                # optional http://user:pass@host:port; blank = use env
+
 ticket_types:
   Story:
     required: [summary, story_points, description]
@@ -292,6 +316,24 @@ ticket_types:
 ```
 
 The `ticket_types` section is managed by the Config GUI. Hand-editing it is safe as long as field names match those in the Field reference table above.
+
+---
+
+## Corporate networks
+
+Open **Config → Network** to configure these, or edit the `network` section of `config.yaml`.
+
+**Certificates (TLS interception).** Many corporate networks inspect TLS through a proxy that presents its own root CA. Python's `requests` verifies against a bundled cert list and **ignores the Windows certificate store**, so requests to `*.atlassian.net` / `api.atlassian.com` can fail with `certificate verify failed` even when IT installed the root CA system-wide. jiramaxx defaults `use_system_certs: true`, which makes it trust the **OS certificate store** (via `truststore`) so those corporate CAs are honored automatically. This is safe for home users — it just uses the standard public roots already in the OS store. If anything goes wrong, it falls back to default behavior.
+
+- Need an explicit cert instead? Set **CA Bundle (PEM path)** (`network.ca_bundle`) or the `REQUESTS_CA_BUNDLE` environment variable.
+- To opt out of OS-store trust, untick **Use the operating-system certificate store** (`use_system_certs: false`).
+
+**Proxies.** If your network requires an outbound proxy, set **Proxy URL** (`network.proxy`), e.g. `http://proxy.corp:8080`. This simply exports `HTTP_PROXY` / `HTTPS_PROXY` (every case variant) for the app, so you don't need to embed credentials in the URL. Leave it blank to use the `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` environment variables you've already set in your shell, which `requests` honors automatically.
+
+**Other things that can bite on a locked-down network:**
+- **Egress allowlists** must permit `*.atlassian.net` and `api.atlassian.com`.
+- **Authenticated proxies (NTLM/Kerberos)** and **PAC auto-config** are not handled directly — set `HTTP_PROXY` / `HTTPS_PROXY` yourself (with inline credentials if your proxy needs them), or run a local proxy bridge.
+- **Recording** ships its Whisper model inside the `jiramaxx-recording` package and transcribes fully offline, so it needs no network access at runtime.
 
 ---
 
@@ -315,3 +357,19 @@ The `ticket_types` section is managed by the Config GUI. Hand-editing it is safe
 - Verify your Board ID is correct. It appears in the Jira board URL: `.../boards/2` → `2`.
 - Confirm the board has an active sprint (not just future sprints).
 
+**Disabling the recording feature in a managed environment**
+
+Recording is a separate, optional package (`jiramaxx-recording`). The strongest control is simply not to mirror it — core `jiramaxx` then has no recording code at all. As an additional belt-and-braces switch (e.g. if a user installs the package themselves), set the environment variable `JIRAMAXX_DISABLE_RECORDING=1` (accepts `1`, `true`, `yes`, or `on`). When set, the Record button is disabled and the Recording tab shows a "disabled by environment policy" message instead of the controls. Suitable for group policy / device baseline configuration.
+
+**Recording fails with `AssertionError` from `soundcard/mediafoundation.py` (e.g. `wFormatTag == 0xFFFE`)**
+
+The `soundcard` library expects the device to report its default audio format as `WAVE_FORMAT_EXTENSIBLE`. Some headsets (notably wireless ones like the SteelSeries Arctis line) report a different format tag and trip a hardcoded assertion. To fix:
+
+1. Open Windows Sound settings (Win+R → `mmsys.cpl`)
+2. **Recording** tab → find the affected device → **Properties**
+3. **Advanced** tab → **Default Format** dropdown
+4. Pick something explicit like `2 channel, 16 bit, 48000 Hz (DVD Quality)` — anything in this dropdown will normally be reported as EXTENSIBLE
+5. Apply, OK
+6. Re-test recording in jiramaxx
+
+If swapping to your laptop's built-in microphone works without this change, the problem is specific to that device's driver and the format override above is the durable fix.

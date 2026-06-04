@@ -12,9 +12,10 @@ from pathlib import Path
 import yaml
 import PySimpleGUI as sg
 
-from .api import JiraClient
+from .api import JiraClient, _network_kwargs, apply_proxy_env
 from .models import FIELD_META, TICKET_CLASSES, init_ticket_config, init_jira_config
 from .utils import safe_read, show_error, bring_to_front
+from .plugins import discover_plugins
 
 ALL_FIELDS = list(FIELD_META.keys())
 TICKET_TYPES = list(TICKET_CLASSES.keys())
@@ -43,6 +44,13 @@ _APP_KEYS = [
     ('UI Theme',        'ui.theme'),
     ('Hotkey: Create',  'hotkeys.create_ticket'),
     ('Hotkey: Manage',  'hotkeys.manage_tickets'),
+]
+
+# Corporate-network settings. ca_bundle/proxy are plain text inputs; the
+# use_system_certs toggle is handled separately (it's a checkbox).
+_NETWORK_KEYS = [
+    ('CA Bundle (PEM path)', 'network.ca_bundle'),
+    ('Proxy URL',            'network.proxy'),
 ]
 
 _DEFAULTS: dict[str, dict] = {
@@ -204,6 +212,42 @@ def _types_tab(type_fields: dict, current_type: str) -> list:
     ]
 
 
+# ── Network tab ──────────────────────────────────────────────────────────────
+
+def _network_tab(config: dict) -> list:
+    net = config.get('network', {})
+    use_system = net.get('use_system_certs', True)
+    W_LBL = 20
+    return [
+        [sg.Text('Corporate Network', font=('Helvetica', 10, 'bold'))],
+        [sg.Checkbox('Use the operating-system certificate store',
+                     default=bool(use_system), key='-CFG-network.use_system_certs-',
+                     tooltip='Trust corporate root CAs that IT installed system-wide '
+                             '(needed for TLS-inspecting proxies). Falls back to '
+                             'defaults if unavailable. Restart to apply.')],
+        [sg.Text('Most home users can leave the settings below blank.',
+                 font=('Helvetica', 8, 'italic'))],
+        [sg.HSep()],
+        [sg.Text('CA Bundle (PEM path)', size=(W_LBL, 1)),
+         sg.Input(_nested_get(config, 'network.ca_bundle'),
+                  key='-CFG-network.ca_bundle-', size=(34, 1), enable_events=True),
+         sg.FileBrowse('Browse', target='-CFG-network.ca_bundle-', size=(7, 1),
+                       file_types=(('Certificates', '*.pem *.crt *.cer'), ('All', '*.*')))],
+        [sg.Text('', size=(W_LBL, 1)),
+         sg.Text('Explicit override / addition to the system store. '
+                 'Also honored: REQUESTS_CA_BUNDLE env var.',
+                 font=('Helvetica', 8))],
+        [sg.HSep()],
+        [sg.Text('Proxy URL', size=(W_LBL, 1)),
+         sg.Input(_nested_get(config, 'network.proxy'),
+                  key='-CFG-network.proxy-', size=(34, 1), enable_events=True)],
+        [sg.Text('', size=(W_LBL, 1)),
+         sg.Text('e.g. http://proxy.corp:8080 — sets HTTP(S)_PROXY for the app. '
+                 'Blank keeps your existing env vars.',
+                 font=('Helvetica', 8))],
+    ]
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def show_config_window(config: dict, config_path: Path) -> dict | None:
@@ -213,13 +257,31 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
     current_type = TICKET_TYPES[0]
 
     def _make_client(v: dict) -> JiraClient:
+        # Pull network settings from the live form so Test Connection / Browse
+        # use the proxy + CA bundle even before the user has saved.
+        net = {
+            'ca_bundle': v.get('-CFG-network.ca_bundle-', '').strip(),
+            'proxy':     v.get('-CFG-network.proxy-', '').strip(),
+        }
+        apply_proxy_env(net)
         return JiraClient(
             v.get('-CFG-jira.base_url-', '').strip(),
             v.get('-CFG-jira.user_email-', '').strip(),
             v.get('-CFG-jira.api_token-', '').strip(),
             token_type=v.get('-CFG-jira.token_type-', 'classic') or 'classic',
             cloud_id=v.get('-CFG-jira.cloud_id-', '').strip(),
+            **_network_kwargs(net),
         )
+
+    plugins = discover_plugins()
+    plugin_tabs = []
+    for p in plugins:
+        try:
+            tab = p.config_tab(working)
+        except Exception:
+            tab = None
+        if tab is not None:
+            plugin_tabs.append(tab)
 
     def _cloud_id_ok(v: dict) -> bool:
         """False (and shows a popup) if scoped mode is selected without Cloud ID."""
@@ -236,7 +298,9 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
         [sg.TabGroup([[
             sg.Tab('Jira',         _jira_tab(working)),
             sg.Tab('App Settings', _app_tab(working)),
+            sg.Tab('Network',      _network_tab(working)),
             sg.Tab('Ticket Types', _types_tab(type_fields, current_type)),
+            *plugin_tabs,
         ]])],
         [sg.Push(),
          sg.Button('Save', key='-SAVE-'),
@@ -251,7 +315,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
     _, _orig_vals = window.read(timeout=0)
     _CHANGED_BG = '#6B4300'
     _DEFAULT_BG = sg.theme_input_background_color()
-    _cfg_keys = [f'-CFG-{k}-' for _, k in _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS]
+    _cfg_keys = [f'-CFG-{k}-' for _, k in
+                 _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS + _NETWORK_KEYS]
 
     def _highlight_changes():
         _, cur = window.read(timeout=0)
@@ -272,6 +337,22 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
         if event in (sg.WIN_CLOSED, '-CANCEL-'):
             window.close()
             return None
+
+        # ── Plugin-owned config events (e.g. recording device browse) ──────
+        _plugin_handled = False
+        for p in plugins:
+            try:
+                if p.handle_config_event(event, values, window, working):
+                    _plugin_handled = True
+                    break
+            except Exception:
+                import traceback
+                show_error('Plugin config error.', tb=traceback.format_exc())
+                _plugin_handled = True
+                break
+        if _plugin_handled:
+            _highlight_changes()
+            continue
 
         # ── Type selector ──────────────────────────────────────────────────
         if event == '-CFG-TYPE-':
@@ -527,14 +608,22 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
 
         # ── Save ───────────────────────────────────────────────────────────
         elif event == '-SAVE-':
-            for _, key in _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS:
+            for _, key in _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS + _NETWORK_KEYS:
                 _nested_set(working, key, values.get(f'-CFG-{key}-', ''))
+            _nested_set(working, 'network.use_system_certs',
+                        bool(values.get('-CFG-network.use_system_certs-', True)))
             working.setdefault('ticket_types', {})
             for t, state in type_fields.items():
                 working['ticket_types'][t] = {
                     'required': state['required'],
                     'optional': state['optional'],
                 }
+            # Let plugins (e.g. recording) write their own config sections.
+            for p in plugins:
+                try:
+                    p.collect_config(values, working)
+                except Exception:
+                    pass
             with open(config_path, 'w') as f:
                 yaml.dump(working, f, default_flow_style=False, sort_keys=False)
             init_ticket_config(working.get('ticket_types', {}))

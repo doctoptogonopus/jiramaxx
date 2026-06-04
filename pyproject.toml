@@ -27,6 +27,16 @@ PySimpleGUI = "4.60.5.1"
 pyyaml = ">=6.0"
 requests = ">=2.28.0"
 keyboard = ">=0.13.5"
+truststore = ">=0.9"
+# Optional recording plugin: a separate distribution (./recording) that plugs
+# into core via entry points. Core never imports it. Referenced by path so a
+# monorepo checkout resolves and installs it editable without publishing.
+# >>> AT PUBLISH TIME, switch to a version constraint and re-lock:
+#     jiramaxx-recording = {version = ">=0.1.0", optional = true}
+jiramaxx-recording = {path = "recording", optional = true, develop = true}
+
+[tool.poetry.extras]
+recording = ["jiramaxx-recording"]
 
 [tool.poetry.scripts]
 jiramaxx = "jiramaxx.main:main"
