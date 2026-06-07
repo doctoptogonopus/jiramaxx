@@ -58,7 +58,6 @@ DEFAULT_CONFIG: dict = {
         'status': 's',
         'subtask': 't',
         'update': 'u',
-        'drafts_order': 'o',
     },
     # Release mode: the status it filters to, and the status it bulk-moves to.
     # Configurable so it adapts to different workflows.

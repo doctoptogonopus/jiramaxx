@@ -14,7 +14,7 @@ import PySimpleGUI as sg
 
 from .api import JiraClient, _network_kwargs, apply_proxy_env
 from .models import FIELD_META, TICKET_CLASSES, init_ticket_config, init_jira_config
-from .utils import safe_read, show_error, bring_to_front
+from .utils import safe_read, show_error, bring_to_front, pick_folder
 from .plugins import discover_plugins
 
 ALL_FIELDS = list(FIELD_META.keys())
@@ -48,9 +48,12 @@ _APP_KEYS = [
     ('Shortcut: Status',     'shortcuts.status'),
     ('Shortcut: Subtask',    'shortcuts.subtask'),
     ('Shortcut: Update',     'shortcuts.update'),
-    ('Shortcut: Order',      'shortcuts.drafts_order'),
-    ('Release: filter status', 'release.filter_status'),
-    ('Release: done status',   'release.done_status'),
+]
+
+# Rendered under a "Release settings" header in the App tab (see _app_tab).
+_RELEASE_KEYS = [
+    ('Pre-Release Status',            'release.filter_status'),
+    ('Completed / Post-Release Status', 'release.done_status'),
 ]
 
 # Corporate-network settings. ca_bundle/proxy are plain text inputs; the
@@ -91,6 +94,24 @@ def _nested_set(d: dict, dotkey: str, value):
     for k in keys[:-1]:
         cur = cur.setdefault(k, {})
     cur[keys[-1]] = value
+
+
+def _nested_get_d(config: dict, dotkey: str) -> str:
+    """Like _nested_get, but falls back to the DEFAULT_CONFIG value when the key is
+    unset — so fields with sensible defaults (data folder, theme, hotkeys, shortcuts,
+    release statuses) show their default instead of being blank."""
+    val = _nested_get(config, dotkey)
+    if val:
+        return val
+    from .main import DEFAULT_CONFIG
+    cur = DEFAULT_CONFIG
+    for k in dotkey.split('.'):
+        if not isinstance(cur, dict):
+            return ''
+        cur = cur.get(k)
+        if cur is None:
+            return ''
+    return str(cur)
 
 
 def _available_for(state: dict) -> list[str]:
@@ -177,10 +198,27 @@ def _jira_tab(config: dict) -> list:
 
 
 def _app_tab(config: dict) -> list:
-    return [[sg.Text(label, size=(18, 1)),
-             sg.Input(_nested_get(config, key), key=f'-CFG-{key}-', size=(38, 1),
-                      enable_events=True)]
-            for label, key in _APP_KEYS]
+    rows = []
+    for label, key in _APP_KEYS:
+        row = [sg.Text(label, size=(18, 1)),
+               sg.Input(_nested_get_d(config, key), key=f'-CFG-{key}-',
+                        size=(34, 1) if key == 'paths.base_dir' else (38, 1),
+                        enable_events=True)]
+        if key == 'paths.base_dir':
+            # Hand-rolled picker (see utils.pick_folder) — the native folder dialog
+            # (FolderBrowse/askdirectory) deadlocks against the global keyboard hook.
+            row.append(sg.Button('Browse', key='-CFG-BROWSE-BASEDIR-', size=(7, 1)))
+        rows.append(row)
+    rows.append([sg.HSep()])
+    rows.append([sg.Text('Release settings', font=('Helvetica', 11, 'bold'))])
+    rows.append([sg.Text('Used by Manage → Release to filter the sprint and to bulk-complete '
+                         'tickets. Set these to match your workflow’s statuses.',
+                         font=('Helvetica', 8))])
+    for label, key in _RELEASE_KEYS:
+        rows.append([sg.Text(label, size=(30, 1)),
+                     sg.Input(_nested_get_d(config, key), key=f'-CFG-{key}-',
+                              size=(26, 1), enable_events=True)])
+    return rows
 
 
 def _types_tab(type_fields: dict, current_type: str) -> list:
@@ -323,7 +361,7 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
     _CHANGED_BG = '#6B4300'
     _DEFAULT_BG = sg.theme_input_background_color()
     _cfg_keys = [f'-CFG-{k}-' for _, k in
-                 _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS + _NETWORK_KEYS]
+                 _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS + _RELEASE_KEYS + _NETWORK_KEYS]
 
     def _highlight_changes():
         _, cur = window.read(timeout=0)
@@ -358,6 +396,13 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                 _plugin_handled = True
                 break
         if _plugin_handled:
+            _highlight_changes()
+            continue
+
+        # ── Data folder picker (hand-rolled; native dialog deadlocks) ──────
+        if event == '-CFG-BROWSE-BASEDIR-':
+            pick_folder(window, '-CFG-paths.base_dir-',
+                        values.get('-CFG-paths.base_dir-', ''))
             _highlight_changes()
             continue
 
@@ -615,7 +660,8 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
 
         # ── Save ───────────────────────────────────────────────────────────
         elif event == '-SAVE-':
-            for _, key in _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS + _NETWORK_KEYS:
+            for _, key in (_JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS
+                           + _RELEASE_KEYS + _NETWORK_KEYS):
                 _nested_set(working, key, values.get(f'-CFG-{key}-', ''))
             _nested_set(working, 'network.use_system_certs',
                         bool(values.get('-CFG-network.use_system_certs-', True)))

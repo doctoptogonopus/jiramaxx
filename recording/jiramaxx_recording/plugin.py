@@ -234,72 +234,14 @@ class RecordingPlugin(Plugin):
         '-REC-BROWSE-SUGGESTIONS-': '-REC-suggestions_dir-',
     }
 
-    @staticmethod
-    def _subdirs(path: str) -> list:
-        import os
-        try:
-            subs = sorted((d for d in os.listdir(path)
-                           if os.path.isdir(os.path.join(path, d))), key=str.lower)
-        except OSError:
-            subs = []
-        return ['..'] + subs
-
-    def _pick_folder(self, window, target_key: str, current: str) -> None:
-        """In-app folder picker (a PySimpleGUI window, NOT the native OS dialog).
-        tkinter's askdirectory deadlocks in this app — its modal loop conflicts
-        with the global keyboard hotkey hook — which is the same reason the audio
-        device browser is hand-rolled. This avoids the native dialog entirely."""
-        import os
-        start = os.path.expanduser(current.strip()) if current.strip() else os.path.expanduser('~')
-        cur = os.path.abspath(start if os.path.isdir(start) else os.path.expanduser('~'))
-
-        layout = [
-            [sg.Text('Current folder:', font=('Helvetica', 9, 'bold'))],
-            [sg.Text(cur, key='-CURP-', size=(62, 1))],
-            [sg.Listbox(self._subdirs(cur), size=(64, 14), key='-DIRS-',
-                        enable_events=True, select_mode='single')],
-            [sg.Text('Or type a path:'),
-             sg.Input(cur, key='-MANUAL-', size=(48, 1)),
-             sg.Button('Go', key='-GO-')],
-            [sg.Push(),
-             sg.Button('Select This Folder', key='-PICK-'),
-             sg.Button('Cancel', key='-CANCEL-')],
-        ]
-        win = sg.Window('Select folder', layout, modal=True, finalize=True)
-        win.bind('<Escape>', '-CANCEL-')
-        bring_to_front(win)
-
-        chosen = None
-        while True:
-            ev, vals = safe_read(win)
-            if ev in (sg.WIN_CLOSED, '-CANCEL-'):
-                break
-            if ev == '-DIRS-' and vals.get('-DIRS-'):
-                sel = vals['-DIRS-'][0]
-                cur = os.path.abspath(os.path.dirname(cur) if sel == '..'
-                                      else os.path.join(cur, sel))
-                win['-CURP-'].update(cur)
-                win['-MANUAL-'].update(cur)
-                win['-DIRS-'].update(self._subdirs(cur))
-            elif ev == '-GO-':
-                p = os.path.expanduser(vals.get('-MANUAL-', '').strip())
-                if p and os.path.isdir(p):
-                    cur = os.path.abspath(p)
-                    win['-CURP-'].update(cur)
-                    win['-DIRS-'].update(self._subdirs(cur))
-                else:
-                    sg.popup('Not a folder.', keep_on_top=True)
-            elif ev == '-PICK-':
-                chosen = cur
-                break
-        win.close()
-        if chosen:
-            window[target_key].update(os.path.normpath(chosen))
-
     def handle_config_event(self, event, values, window, working: dict) -> bool:
         if event in self._FOLDER_BROWSE_TARGETS:
+            # Hand-rolled in-app folder picker — the native folder dialog
+            # (askdirectory) deadlocks against the global keyboard hook. Lives in
+            # core so it works whether or not recording is the active caller.
+            from jiramaxx.utils import pick_folder
             target = self._FOLDER_BROWSE_TARGETS[event]
-            self._pick_folder(window, target, values.get(target, ''))
+            pick_folder(window, target, values.get(target, ''))
             return True
 
         if event == '-REC-DLMODEL-':

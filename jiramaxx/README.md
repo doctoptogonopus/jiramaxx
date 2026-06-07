@@ -188,7 +188,7 @@ Which fields are required vs. optional is fully configurable per ticket type in 
 
 Drafts are stored as YAML files under your **data folder** — `~/.jiramaxx/drafts/` by default (configurable via **Data folder**, see Widget Settings). A draft is created any time you click **Save Draft** (or quick-save a title from the New Ticket screen). After a successful Jira submission the ticket is also retained locally (marked submitted) so you have a local record.
 
-The list is ordered **newest-first** by default. Press **O** (or click **Order**) to sort by creation time (newest/oldest), type, or summary.
+The list is ordered **newest-first** by default. Click the **☰** button in the top-right corner to sort by creation time (newest/oldest), type, or summary.
 
 ### Draft list actions
 
@@ -196,7 +196,7 @@ The list is ordered **newest-first** by default. Press **O** (or click **Order**
 |---|---|
 | **Open** / Enter / double-click | Re-open the ticket form to continue editing or submit |
 | **Delete** | Permanently removes the local draft (prompts for confirmation) |
-| **O** / Order | Change the sort order |
+| **☰** (top-right) | Change the sort order (no hotkey) |
 | **Cancel** / Escape | Returns to the main window |
 
 ---
@@ -207,6 +207,8 @@ Press **M** to open the sprint ticket manager. It shows the issues in your **act
 
 The first ticket is selected automatically — use the **↑ / ↓ arrow keys** to navigate the list without clicking.
 
+The list shows columns for **Key, Summary, Epic, and Due date**. (In the grouped view, Status and Due appear as columns alongside the epic tree.)
+
 **It opens instantly from a local snapshot** — the sprint list is cached on disk (under `<data folder>/drafts/sprints/`) so re-opening the manager does not hit the network. Press **U** (**Update**) to refetch the current sprint from Jira and refresh the snapshot.
 
 | Button / Key | Action |
@@ -215,11 +217,11 @@ The first ticket is selected automatically — use the **↑ / ↓ arrow keys** 
 | **S** | Change the status of the selected ticket |
 | **T** | Create a **subtask** of the selected ticket |
 | **U** | **Update** — refetch the sprint from Jira |
-| **Options** | Sort the list / group by epic (see below) |
-| **Release** | Enter release-coordinator mode (see below) |
+| **☰** (top-right) | Sort the list / group by epic (see below; no hotkey) |
+| **Release** (top-right) | Enter release-coordinator mode (see below) |
 | **X** / Escape | Close the manager |
 
-The single-key shortcuts (C / S / T / U) are configurable — see **Shortcuts** under Widget Settings.
+The single-key shortcuts (C / S / T / U) are configurable — see **Shortcuts** under Widget Settings. The **☰** options menu and **Release** button sit in the top-right corner and are click-only.
 
 ### Add Comment
 
@@ -233,9 +235,9 @@ Select a ticket and press **S** (or click Change Status). The tool fetches the a
 
 Select a ticket and press **T** (or click Subtask). The same **title-first** new-ticket flow opens, with the selected ticket pre-set as the **parent**. Save it as a draft or continue to the full form.
 
-### Options — sort & group by epic
+### Options (☰) — sort & group by epic
 
-Click **Options** to:
+Click the **☰** button in the top-right corner to:
 
 - **Sort by** Priority, Due date, Status, Assignee, or Key (ascending or descending). The default is most-recently-updated.
 - **Group by epic** — switch the flat list to a collapsible tree where your tickets are nested under their epic. The epic appears as a (non-actionable) grouping header even though it isn't assigned to you; only *your* tickets are listed under it. Toggle it off to return to the flat list. Handy when your tickets span several epics; leave it off for a quick flat view.
@@ -244,9 +246,9 @@ Click **Options** to:
 
 Click **Release** for a coordinator view of everyone's tickets in the active sprint that are in a chosen status (default **"Ready for Release"**, configurable — see Widget Settings). From here you can:
 
-- **Copy Keys** — copy all matching ticket keys to the clipboard.
-- **Copy Users** — copy the unique assignees who have tickets in that status.
-- **Bulk → Done** — transition every listed ticket to the configured done status (default **"Done"**) in one action (with confirmation).
+- **Copy Keys** — copy all matching ticket keys to the clipboard as a **comma-separated** list.
+- **Copy Users** — copy the unique assignee **emails** to the clipboard (falls back to display name where Jira doesn't expose the email).
+- **Bulk → Done** — opens a **checklist** of the listed tickets (all checked); uncheck any that aren't actually complete, then move the rest to the configured done status (default **"Done"**) in one action.
 - **Update** — refetch; **Back** / Escape returns to the manager.
 
 ---
@@ -263,14 +265,18 @@ Credentials and connection settings. See the Setup section above.
 
 | Setting | Notes |
 |---|---|
-| **Data folder** | One folder holding drafts and the sprint snapshot cache (config.yaml also lives here). Supports `~` expansion. Default: `~/.jiramaxx`. Move or clear this one folder to relocate/reset all local state. |
+| **Data folder** | One folder holding drafts and the sprint snapshot cache (config.yaml also lives here). Supports `~` expansion. Default: `~/.jiramaxx`. Use the **Browse** button to pick a folder. Move or clear this one folder to relocate/reset all local state. |
 | **UI Theme** | Any valid PySimpleGUI theme name, e.g. `DarkBlue3`, `LightGrey1`, `Reddit`. |
 | **Hotkey: Create** | Global hotkey to open the main window. Default: `ctrl+alt+j` |
 | **Hotkey: Manage** | Global hotkey to open the sprint manager directly. Default: `ctrl+alt+m` |
 | **Shortcut: Comment / Status / Subtask / Update** | In-window single-key shortcuts in the sprint manager. Defaults: `c` / `s` / `t` / `u`. |
-| **Shortcut: Order** | Single-key shortcut to reorder the Drafts list. Default: `o`. |
-| **Release: filter status** | The status Release mode filters to. Default: `Ready for Release`. Set this to match your workflow. |
-| **Release: done status** | The status Release mode's "Bulk → Done" transitions tickets to. Default: `Done`. |
+
+Under **Release settings** (own section at the bottom of the tab):
+
+| Setting | Notes |
+|---|---|
+| **Pre-Release Status** | The status Release mode filters the sprint to. Default: `Ready for Release`. Set this to match your workflow. |
+| **Completed / Post-Release Status** | The status Release mode's "Bulk → Done" transitions tickets to. Default: `Done`. |
 
 Theme changes take effect the next time you open a window. Global hotkeys require a daemon restart; in-window shortcuts apply the next time you open that window.
 
@@ -336,7 +342,6 @@ shortcuts:                  # in-window single-key shortcuts (apply on next open
   status:       s
   subtask:      t
   update:       u
-  drafts_order: o
 
 release:                    # release-coordinator mode (Manage → Release)
   filter_status: Ready for Release   # status it lists

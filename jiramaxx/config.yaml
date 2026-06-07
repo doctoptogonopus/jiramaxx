@@ -26,7 +26,6 @@ shortcuts:
   status: s
   subtask: t
   update: u
-  drafts_order: o
 release:
   filter_status: Ready for Release
   done_status: Done
