@@ -9,9 +9,10 @@ class Cache:
     def __init__(self, directory: str):
         self.dir = Path(directory).expanduser()
         self.dir.mkdir(parents=True, exist_ok=True)
-        # Sprint snapshots live in a subfolder so the draft glob (*.yaml in self.dir,
-        # non-recursive) never mistakes them for drafts.
-        self.sprint_dir = self.dir / 'sprints'
+        # Active-sprint ticket snapshot lives in a sibling folder next to drafts
+        # (i.e. directly under the data folder, alongside transcripts) — also keeps
+        # it clear of the draft glob (*.yaml in self.dir, non-recursive).
+        self.active_tickets_dir = self.dir.parent / 'active_tickets'
 
     def _path(self, ticket_id: str) -> Path:
         return self.dir / f"{ticket_id}.yaml"
@@ -43,23 +44,23 @@ class Cache:
     def submitted(self) -> list[Ticket]:
         return [t for t in self.load_all() if t.submitted]
 
-    # ── Sprint snapshot cache ────────────────────────────────────────────────
-    # Persisted as readable YAML so the Manage window opens instantly from disk
-    # and only hits the network when the user presses Update. ``mine`` keeps the
-    # assigned-to-me list separate from the all-users Release-mode list.
+    # ── Active-sprint ticket snapshot ─────────────────────────────────────────
+    # Persisted as readable YAML so the Manage window opens instantly from disk and
+    # only hits the network when the user presses Update. A single file, overwritten
+    # on each refresh — nothing accumulates.
 
-    def _sprint_path(self, mine: bool) -> Path:
-        return self.sprint_dir / (f"sprint_{'mine' if mine else 'all'}.yaml")
+    def _active_tickets_path(self) -> Path:
+        return self.active_tickets_dir / 'mine.yaml'
 
-    def save_sprint_issues(self, issues: list[dict], *, mine: bool) -> None:
-        self.sprint_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._sprint_path(mine), 'w') as f:
+    def save_sprint_issues(self, issues: list[dict]) -> None:
+        self.active_tickets_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._active_tickets_path(), 'w') as f:
             yaml.dump({'fetched_at': datetime.now().isoformat(), 'issues': issues},
                       f, default_flow_style=False, sort_keys=False)
 
-    def load_sprint_issues(self, *, mine: bool) -> dict | None:
+    def load_sprint_issues(self) -> dict | None:
         """Return {'fetched_at', 'issues'} from the last snapshot, or None."""
-        path = self._sprint_path(mine)
+        path = self._active_tickets_path()
         if not path.exists():
             return None
         try:

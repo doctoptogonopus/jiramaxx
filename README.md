@@ -209,7 +209,7 @@ The first ticket is selected automatically — use the **↑ / ↓ arrow keys** 
 
 The list shows columns for **Key, Summary, Epic, and Due date**. (In the grouped view, Status and Due appear as columns alongside the epic tree.)
 
-**It opens instantly from a local snapshot** — the sprint list is cached on disk (under `<data folder>/drafts/sprints/`) so re-opening the manager does not hit the network. Press **U** (**Update**) to refetch the current sprint from Jira and refresh the snapshot.
+**It opens instantly from a local snapshot** — the sprint list is cached on disk (a single overwritten file under `<data folder>/active_tickets/`) so re-opening the manager does not hit the network. Press **U** (**Update**) to refetch the current sprint from Jira and refresh the snapshot.
 
 | Button / Key | Action |
 |---|---|

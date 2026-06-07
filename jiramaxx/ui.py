@@ -352,7 +352,8 @@ def show_draft_list(drafts: list[Ticket], cache: Cache,
          sg.Button('☰', key='-ORDER-', size=(3, 1), tooltip='Sort order')],
         [sg.Listbox(labels, size=(72, min(len(drafts) + 1, 12)),
                     key='-LIST-', enable_events=False, font=('Consolas', 10),
-                    select_mode=sg.LISTBOX_SELECT_MODE_BROWSE)],
+                    tooltip='Ctrl/Shift-click to select several (for Delete)',
+                    select_mode=sg.LISTBOX_SELECT_MODE_EXTENDED)],
         [sg.Push(),
          sg.Button('Open',   key='-OPEN-'),
          sg.Button('Delete', key='-DELETE-'),
@@ -381,25 +382,33 @@ def show_draft_list(drafts: list[Ticket], cache: Cache,
                 _soft_select(window, 0)
             continue
 
-        sel = values.get('-LIST-')
-        if not sel and event in ('-OPEN-', '-DELETE-'):
-            sg.popup('Select a draft first.', modal=True, keep_on_top=True)
-            continue
+        if event in ('-OPEN-', '-DELETE-'):
+            # get_indexes() maps selection straight to positions (robust even when
+            # two drafts share an identical label).
+            idxs = sorted(window['-LIST-'].get_indexes())
+            if not idxs:
+                sg.popup('Select a draft first.', modal=True, keep_on_top=True)
+                continue
 
-        if sel:
-            idx = labels.index(sel[0])
             if event == '-OPEN-':
-                result = drafts[idx]
+                result = drafts[idxs[0]]  # open the first selected
                 break
+
             if event == '-DELETE-':
-                if sg.popup_yes_no(f"Delete '{drafts[idx].summary or '(no title)'}'?") == 'Yes':
-                    cache.delete(drafts[idx].ticket_id)
-                    drafts.pop(idx)
-                    labels.pop(idx)
+                n = len(idxs)
+                prompt = (f'Delete these {n} drafts?' if n > 1
+                          else f"Delete '{drafts[idxs[0]].summary or '(no title)'}'?")
+                # keep_on_top so the confirmation sits above the (keep-on-top) list.
+                if sg.popup_yes_no(prompt, title='Delete drafts',
+                                   modal=True, keep_on_top=True) == 'Yes':
+                    for i in reversed(idxs):  # delete high→low to keep indices valid
+                        cache.delete(drafts[i].ticket_id)
+                        drafts.pop(i)
+                        labels.pop(i)
                     window['-LIST-'].update(labels)
                     if not drafts:
                         break
-                    _soft_select(window, idx)
+                    _soft_select(window, min(idxs[0], len(drafts) - 1))
 
     window.close()
     return result
@@ -626,14 +635,14 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
     def _fetch() -> list[dict]:
         return jira.get_sprint_issues(proj, mine=True, epic_link_cf=epic_cf)
 
-    snap = cache.load_sprint_issues(mine=True)
+    snap = cache.load_sprint_issues()
     if snap is None:
         try:
             issues = _fetch()
         except Exception as exc:
             show_error(f"Could not fetch sprint tickets:\n{exc}", tb=_tb.format_exc())
             return
-        cache.save_sprint_issues(issues, mine=True)
+        cache.save_sprint_issues(issues)
         fetched = 'just now'
     else:
         issues = snap['issues']
@@ -732,7 +741,7 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
             if event == '-UPDATE-':
                 try:
                     state['issues'] = _fetch()
-                    cache.save_sprint_issues(state['issues'], mine=True)
+                    cache.save_sprint_issues(state['issues'])
                     state['fetched'] = datetime.now().isoformat()[:19].replace('T', ' ')
                 except Exception as exc:
                     show_error(f"Update failed:\n{exc}", tb=_tb.format_exc())
@@ -854,9 +863,14 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
 
         elif event == '-DRAFTS-':
             window.hide()
-            drafts = cache.drafts()
-            chosen = show_draft_list(drafts, cache, config)
-            if chosen:
+            # Loop so that opening a draft and leaving its form returns to the
+            # drafts list (not the main window); break out only when the list is
+            # cancelled or empty.
+            while True:
+                drafts = cache.drafts()
+                chosen = show_draft_list(drafts, cache, config)
+                if not chosen:
+                    break
                 show_ticket_form(chosen, cache, jira, config)
             window.un_hide()
             bring_to_front(window)
