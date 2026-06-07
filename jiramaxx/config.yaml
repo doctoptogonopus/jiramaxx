@@ -14,13 +14,22 @@ jira:
   token_type: scoped
   cloud_id:
   sprint_cache:
-cache:
-  directory: ~/.jira_tool/cache
+paths:
+  base_dir: ~/.jiramaxx
 ui:
   theme: DarkBlue3
 hotkeys:
   create_ticket: ctrl+alt+j
   manage_tickets: ctrl+alt+m
+shortcuts:
+  comment: c
+  status: s
+  subtask: t
+  update: u
+  drafts_order: o
+release:
+  filter_status: Ready for Release
+  done_status: Done
 ticket_types:
   Story:
     required:

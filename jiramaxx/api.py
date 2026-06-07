@@ -127,11 +127,31 @@ class JiraClient:
     def transition_issue(self, issue_key: str, transition_id: str):
         self._post(f'/rest/api/3/issue/{issue_key}/transitions', {'transition': {'id': transition_id}})
 
-    def get_active_sprint_issues(self, board_id: int, project_key: str) -> list[dict]:
+    def get_sprint_issues(self, project_key: str, *, mine: bool = True,
+                          status: str | None = None,
+                          epic_link_cf: str | None = None) -> list[dict]:
+        """Issues in the *active* sprint of ``project_key``.
+
+        ``sprint in openSprints()`` restricts to the active sprint (excludes both
+        closed and not-yet-started future sprints). ``mine`` adds an
+        ``assignee = currentUser()`` clause; ``status`` filters to a single status
+        (used by Release mode). Extra fields (duedate, parent, epic link) are
+        requested so the UI can sort and group without follow-up calls.
+        """
+        clauses = [f'project="{project_key}"', 'sprint in openSprints()']
+        if mine:
+            clauses.append('assignee = currentUser()')
+        if status:
+            clauses.append(f'status = "{status}"')
+        jql = ' AND '.join(clauses) + ' ORDER BY updated DESC'
+        fields = ['summary', 'status', 'assignee', 'issuetype', 'priority',
+                  'duedate', 'parent']
+        if epic_link_cf:
+            fields.append(epic_link_cf)
         data = self._get('/rest/api/3/search/jql', {
-            'jql': f'project="{project_key}" AND sprint not in closedSprints() ORDER BY updated DESC',
-            'maxResults': 50,
-            'fields': 'summary,status,assignee,issuetype,priority',
+            'jql': jql,
+            'maxResults': 100,
+            'fields': ','.join(fields),
         })
         return data.get('issues', [])
 

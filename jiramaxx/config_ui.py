@@ -40,10 +40,17 @@ _CUSTOM_FIELD_KEYS = [
 ]
 
 _APP_KEYS = [
-    ('Cache Directory', 'cache.directory'),
-    ('UI Theme',        'ui.theme'),
-    ('Hotkey: Create',  'hotkeys.create_ticket'),
-    ('Hotkey: Manage',  'hotkeys.manage_tickets'),
+    ('Data folder',          'paths.base_dir'),
+    ('UI Theme',             'ui.theme'),
+    ('Hotkey: Create',       'hotkeys.create_ticket'),
+    ('Hotkey: Manage',       'hotkeys.manage_tickets'),
+    ('Shortcut: Comment',    'shortcuts.comment'),
+    ('Shortcut: Status',     'shortcuts.status'),
+    ('Shortcut: Subtask',    'shortcuts.subtask'),
+    ('Shortcut: Update',     'shortcuts.update'),
+    ('Shortcut: Order',      'shortcuts.drafts_order'),
+    ('Release: filter status', 'release.filter_status'),
+    ('Release: done status',   'release.done_status'),
 ]
 
 # Corporate-network settings. ca_bundle/proxy are plain text inputs; the

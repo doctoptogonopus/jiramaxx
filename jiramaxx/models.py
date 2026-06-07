@@ -79,6 +79,10 @@ class Ticket(ABC):
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     jira_key: Optional[str] = None
     submitted: bool = False
+    # Parent issue key for subtasks (set programmatically, not a form field). Kept
+    # out of FIELD_META so it never renders; apply_form_values leaves it untouched
+    # and to_dict persists it, so a saved subtask draft remembers its parent.
+    parent: str = ''
 
     @property
     @abstractmethod
@@ -150,6 +154,8 @@ class Ticket(ABC):
                 'issuetype': {'name': self.ticket_type},
             }
         }
+        if self.parent:
+            payload['fields']['parent'] = {'key': self.parent.strip()}
         if self.priority:
             payload['fields']['priority'] = {'name': self.priority}
         if self.assignee:
