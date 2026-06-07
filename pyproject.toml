@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "jiramaxx"
-version = "1.0.0"
+version = "1.1.0"
 description = "A lightweight console GUI for creating and managing Jira tickets without leaving your keyboard"
 authors = []
 readme = "jiramaxx/README.md"
@@ -31,7 +31,7 @@ truststore = ">=0.9"
 # Optional recording plugin: a separate distribution (./recording) that plugs
 # into core via entry points. Core never imports it. Referenced by path so a
 # monorepo checkout resolves and installs it editable without publishing.
-jiramaxx-recording = {version = ">=1.0.0", optional = true}
+jiramaxx-recording = {version = ">=1.1.0", optional = true}
 
 [tool.poetry.extras]
 recording = ["jiramaxx-recording"]
