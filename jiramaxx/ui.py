@@ -1,6 +1,7 @@
 from __future__ import annotations
+from datetime import datetime
 import PySimpleGUI as sg
-from .models import Ticket, TICKET_CLASSES, FIELD_META
+from .models import Ticket, Task, TICKET_CLASSES, FIELD_META
 from .cache import Cache
 from .api import JiraClient
 import traceback as _tb
@@ -11,9 +12,86 @@ _LABEL_W = 22
 _INPUT_W = 42
 _MULTI_H = 5
 
+_PRIORITY_RANK = {'Highest': 0, 'High': 1, 'Medium': 2, 'Low': 3, 'Lowest': 4}
+
 
 def _fkey(field_name: str) -> str:
     return f'-FIELD-{field_name.upper()}-'
+
+
+def _sc(config: dict, name: str, default: str) -> str:
+    """Read a configurable in-window shortcut key (single character)."""
+    return ((config.get('shortcuts') or {}).get(name) or default).strip() or default
+
+
+def _epic_link_cf(config: dict) -> str:
+    return ((config.get('jira', {}).get('custom_fields') or {}).get('epic_link')
+            or 'customfield_10014')
+
+
+# ── Issue field accessors (operate on raw Jira search results) ────────────────
+
+def _i_priority(i: dict) -> str:
+    return ((i.get('fields', {}).get('priority') or {}).get('name')) or ''
+
+
+def _i_status(i: dict) -> str:
+    return ((i.get('fields', {}).get('status') or {}).get('name')) or ''
+
+
+def _i_assignee(i: dict) -> str:
+    a = i.get('fields', {}).get('assignee')
+    return (a.get('displayName') or '(unassigned)') if a else '(unassigned)'
+
+
+def _i_assignee_email(i: dict) -> str:
+    """Assignee email when Jira exposes it (profile visibility permitting); falls
+    back to the display name, then '(unassigned)'."""
+    a = i.get('fields', {}).get('assignee') or {}
+    return a.get('emailAddress') or a.get('displayName') or '(unassigned)'
+
+
+def _i_due(i: dict) -> str:
+    return i.get('fields', {}).get('duedate') or ''
+
+
+def _i_epic(i: dict, epic_cf: str) -> tuple[str | None, str | None]:
+    """Resolve an issue's epic to (key, label). Prefers the parent (which carries
+    the epic key + summary in the search response), else the epic-link custom
+    field (key only). Returns (None, None) when there is no epic."""
+    f = i.get('fields', {})
+    parent = f.get('parent')
+    if parent:
+        key = parent.get('key')
+        summ = (parent.get('fields', {}) or {}).get('summary', '')
+        return key, f"{key}  {summ}".strip()
+    el = f.get(epic_cf)
+    if el:
+        return str(el), str(el)
+    return None, None
+
+
+def _sort_issues(issues: list[dict], sort: str | None, descending: bool) -> list[dict]:
+    if not sort:
+        return issues  # API default order (updated DESC)
+    keyfns = {
+        'Priority': lambda i: _PRIORITY_RANK.get(_i_priority(i), 99),
+        'Due date': lambda i: _i_due(i) or '9999-99-99',
+        'Status':   lambda i: _i_status(i).lower(),
+        'Assignee': lambda i: _i_assignee(i).lower(),
+        'Key':      lambda i: i.get('key', ''),
+    }
+    fn = keyfns.get(sort)
+    return sorted(issues, key=fn, reverse=descending) if fn else issues
+
+
+def _to_clipboard(window, text: str) -> None:
+    try:
+        window.TKroot.clipboard_clear()
+        window.TKroot.clipboard_append(text)
+        window.TKroot.update()
+    except Exception:
+        pass
 
 
 def _soft_select(window, idx: int = 0, key: str = '-LIST-') -> None:
@@ -148,7 +226,7 @@ def show_type_selector() -> str | None:
         *[[sg.Button(f'({t[0]}) {t}', key=t, size=(16, 2))] for t in TICKET_CLASSES],
         [sg.Button('Cancel', key='-CANCEL-', size=(16, 1))],
     ]
-    window = sg.Window('New Ticket', layout, finalize=True, modal=True)
+    window = sg.Window('New Ticket', layout, finalize=True, modal=True, keep_on_top=True)
     window.bind('<Escape>', '-CANCEL-')
     bring_to_front(window)
     for i, t in enumerate(TICKET_CLASSES, 1):
@@ -161,28 +239,128 @@ def show_type_selector() -> str | None:
     return event if event in TICKET_CLASSES else None
 
 
+# ─── Title-first new ticket flow (also powers "Create Subtask") ───────────────
+
+def show_new_ticket_flow(cache: Cache, jira: JiraClient, config: dict,
+                         parent_key: str | None = None) -> None:
+    """Title-first creation: one title field, then Save (quick-save a Task draft),
+    Edit (pick a type → full form), or Cancel. ``parent_key`` makes the result a
+    subtask of that issue (carried via Ticket.parent into the Jira payload)."""
+    heading = f'New Subtask of {parent_key}' if parent_key else 'New Ticket'
+    layout = [
+        [sg.Text(heading, font=('Helvetica', 13, 'bold'))],
+        [sg.Text('Title:', size=(6, 1)), sg.Input('', key='-TITLE-', size=(50, 1))],
+        [sg.HSep()],
+        [sg.Push(),
+         sg.Button('Save (Ctrl+S)', key='-SAVE-'),
+         sg.Button('Edit (Enter)',  key='-EDIT-'),
+         sg.Button('Cancel',        key='-CANCEL-')],
+    ]
+    window = sg.Window('New Ticket', layout, finalize=True, modal=True,
+                       keep_on_top=True, return_keyboard_events=False)
+    window.bind('<Escape>', '-CANCEL-')
+    window.bind('<Return>', '-EDIT-')
+    window.bind('<Control-s>', '-SAVE-')
+    window.bind('<Control-S>', '-SAVE-')
+    bring_to_front(window)
+    window['-TITLE-'].set_focus()
+
+    action, title = None, ''
+    while True:
+        event, values = _read(window)
+        if event in (sg.WIN_CLOSED, '-CANCEL-'):
+            break
+        title = (values.get('-TITLE-') or '').strip()
+        if event in ('-SAVE-', '-EDIT-'):
+            if not title:
+                sg.popup('Enter a title first.', modal=True, keep_on_top=True)
+                continue
+            action = 'save' if event == '-SAVE-' else 'edit'
+            break
+    window.close()
+
+    if action == 'save':
+        ticket = Task()
+        ticket.summary = title
+        if parent_key:
+            ticket.parent = parent_key
+        cache.save(ticket)
+        sg.popup_quick_message('Draft saved.', auto_close_duration=1,
+                               background_color='#2e7d32', text_color='white')
+    elif action == 'edit':
+        ticket_type = show_type_selector()
+        if ticket_type:
+            ticket = TICKET_CLASSES[ticket_type]()
+            ticket.summary = title
+            if parent_key:
+                ticket.parent = parent_key
+            show_ticket_form(ticket, cache, jira, config)
+
+
 # ─── Draft list ─────────────────────────────────────────────────────────────
 
-def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
-    """Show drafts, let user open or delete one. Returns the ticket to open, or None."""
+_DRAFT_ORDERS = ['Created (newest)', 'Created (oldest)', 'Type', 'Summary']
+
+
+def _draft_label(t: Ticket) -> str:
+    # Truncate the summary to a fixed width so the trailing date column always
+    # lines up (rendered in a monospace font — see the Listbox below).
+    summ = t.summary or '(no title)'
+    summ = (summ[:39] + '…') if len(summ) > 40 else summ
+    return f"[{t.ticket_type:10s}]  {summ:40s}  {t.created_at[:10]}"
+
+
+def _sort_drafts(drafts: list[Ticket], order: str) -> list[Ticket]:
+    if order == 'Created (oldest)':
+        return sorted(drafts, key=lambda t: t.created_at)
+    if order == 'Type':
+        return sorted(drafts, key=lambda t: (t.ticket_type, t.created_at))
+    if order == 'Summary':
+        return sorted(drafts, key=lambda t: (t.summary or '').lower())
+    return sorted(drafts, key=lambda t: t.created_at, reverse=True)  # newest first
+
+
+def _order_popup(options: list[str], current: str) -> str | None:
+    """Tiny modal to pick a sort order. Returns the chosen option or None."""
+    layout = [
+        [sg.Text('Order by', font=('Helvetica', 12, 'bold'))],
+        [sg.Combo(options, default_value=current, key='-O-', readonly=True, size=(20, 1))],
+        [sg.Push(), sg.Button('Apply', key='-A-'), sg.Button('Cancel', key='-C-')],
+    ]
+    w = sg.Window('Order', layout, finalize=True, modal=True, keep_on_top=True)
+    w.bind('<Escape>', '-C-')
+    w.bind('<Return>', '-A-')
+    bring_to_front(w)
+    ev, vals = _read(w)
+    w.close()
+    return vals.get('-O-') if ev == '-A-' else None
+
+
+def show_draft_list(drafts: list[Ticket], cache: Cache,
+                    config: dict | None = None) -> Ticket | None:
+    """Show drafts, let user open/delete/reorder one. Returns the ticket to open."""
     if not drafts:
         sg.popup('No drafts found.', title='Drafts', modal=True, keep_on_top=True)
         return None
 
-    labels = [f"[{t.ticket_type:10s}]  {t.summary or '(no title)':40s}  {t.created_at[:10]}"
-              for t in drafts]
+    order = _DRAFT_ORDERS[0]  # newest first by default
+    drafts = _sort_drafts(list(drafts), order)
+    labels = [_draft_label(t) for t in drafts]
     layout = [
-        [sg.Text(f'{len(drafts)} incomplete draft(s)', font=('Helvetica', 12, 'bold'))],
+        [sg.Text(f'{len(drafts)} incomplete draft(s)', font=('Helvetica', 12, 'bold')),
+         sg.Push(),
+         sg.Button('☰', key='-ORDER-', size=(3, 1), tooltip='Sort order')],
         [sg.Listbox(labels, size=(72, min(len(drafts) + 1, 12)),
-                    key='-LIST-', enable_events=False,
-                    select_mode=sg.LISTBOX_SELECT_MODE_BROWSE)],
+                    key='-LIST-', enable_events=False, font=('Consolas', 10),
+                    tooltip='Ctrl/Shift-click to select several (for Delete)',
+                    select_mode=sg.LISTBOX_SELECT_MODE_EXTENDED)],
         [sg.Push(),
          sg.Button('Open',   key='-OPEN-'),
          sg.Button('Delete', key='-DELETE-'),
          sg.Button('Cancel', key='-CANCEL-')],
     ]
     window = sg.Window('Drafts', layout, finalize=True,
-                       return_keyboard_events=False, modal=True)
+                       return_keyboard_events=False, modal=True, keep_on_top=True)
     window.bind('<Escape>', '-CANCEL-')
     bring_to_front(window)
     window.bind('<Return>', '-OPEN-')
@@ -194,114 +372,427 @@ def show_draft_list(drafts: list[Ticket], cache: Cache) -> Ticket | None:
         if event in (sg.WIN_CLOSED, '-CANCEL-'):
             break
 
-        sel = values.get('-LIST-')
-        if not sel and event in ('-OPEN-', '-DELETE-'):
-            sg.popup('Select a draft first.', modal=True, keep_on_top=True)
+        if event == '-ORDER-':
+            chosen = _order_popup(_DRAFT_ORDERS, order)
+            if chosen and chosen != order:
+                order = chosen
+                drafts = _sort_drafts(drafts, order)
+                labels = [_draft_label(t) for t in drafts]
+                window['-LIST-'].update(labels)
+                _soft_select(window, 0)
             continue
 
-        if sel:
-            idx = labels.index(sel[0])
+        if event in ('-OPEN-', '-DELETE-'):
+            # get_indexes() maps selection straight to positions (robust even when
+            # two drafts share an identical label).
+            idxs = sorted(window['-LIST-'].get_indexes())
+            if not idxs:
+                sg.popup('Select a draft first.', modal=True, keep_on_top=True)
+                continue
+
             if event == '-OPEN-':
-                result = drafts[idx]
+                result = drafts[idxs[0]]  # open the first selected
                 break
+
             if event == '-DELETE-':
-                if sg.popup_yes_no(f"Delete '{drafts[idx].summary or '(no title)'}'?") == 'Yes':
-                    cache.delete(drafts[idx].ticket_id)
-                    drafts.pop(idx)
-                    labels.pop(idx)
+                n = len(idxs)
+                prompt = (f'Delete these {n} drafts?' if n > 1
+                          else f"Delete '{drafts[idxs[0]].summary or '(no title)'}'?")
+                # keep_on_top so the confirmation sits above the (keep-on-top) list.
+                if sg.popup_yes_no(prompt, title='Delete drafts',
+                                   modal=True, keep_on_top=True) == 'Yes':
+                    for i in reversed(idxs):  # delete high→low to keep indices valid
+                        cache.delete(drafts[i].ticket_id)
+                        drafts.pop(i)
+                        labels.pop(i)
                     window['-LIST-'].update(labels)
                     if not drafts:
                         break
-                    _soft_select(window, idx)
+                    _soft_select(window, min(idxs[0], len(drafts) - 1))
 
     window.close()
     return result
 
 
-# ─── Ticket interaction (comment / status change) ────────────────────────────
+# ─── Ticket interaction (comment / status / subtask / release) ───────────────
 
-def show_interaction_window(jira: JiraClient, config: dict):
+def _change_status(jira: JiraClient, issue_key: str) -> bool:
+    """Modal transition picker for one issue. Returns True if a transition applied."""
     try:
-        issues = jira.get_active_sprint_issues(config['jira']['board_id'],
-                                               config['jira']['project_key'])
+        transitions = jira.get_transitions(issue_key)
     except Exception as exc:
-        show_error(f"Could not fetch sprint tickets:\n{exc}", tb=_tb.format_exc())
-        return
-
-    if not issues:
-        sg.popup('No active sprint tickets found.', modal=True, keep_on_top=True)
-        return
-
-    labels = [f"{i['key']:12s}  {i['fields']['summary']}" for i in issues]
-    layout = [
-        [sg.Text('Current Sprint Tickets', font=('Helvetica', 12, 'bold'))],
-        [sg.Listbox(labels, size=(72, min(len(issues) + 1, 14)),
-                    key='-LIST-', enable_events=False,
-                    select_mode=sg.LISTBOX_SELECT_MODE_BROWSE)],
-        [sg.Push(),
-         sg.Button('(C) Add Comment',   key='-COMMENT-'),
-         sg.Button('(S) Change Status', key='-STATUS-'),
-         sg.Button('(X) Close',         key='-CANCEL-')],
+        show_error(f"API error:\n{exc}", tb=_tb.format_exc())
+        return False
+    t_names = [t['name'] for t in transitions]
+    if not t_names:
+        sg.popup('No transitions available.', modal=True, keep_on_top=True)
+        return False
+    layout_s = [
+        [sg.Text(f'Transitions for {issue_key}', font=('Helvetica', 11, 'bold'))],
+        [sg.Listbox(t_names, size=(40, min(len(t_names) + 1, 8)),
+                    key='-T-', select_mode=sg.LISTBOX_SELECT_MODE_SINGLE)],
+        [sg.Button('Apply', key='-APPLY-'), sg.Button('Cancel', key='-TCANCEL-')],
     ]
-    window = sg.Window('Manage Tickets', layout, finalize=True)
-    window.bind('<Escape>', '-CANCEL-')
-    bring_to_front(window)
-    for ch, ev in [('c', '-COMMENT-'), ('C', '-COMMENT-'),
-                   ('s', '-STATUS-'),  ('S', '-STATUS-'),
-                   ('x', '-CANCEL-'),  ('X', '-CANCEL-')]:
-        window.bind(ch, ev)
-    _soft_select(window, 0)
+    tw = sg.Window('Change Status', layout_s, finalize=True, modal=True, keep_on_top=True)
+    tw.bind('<Escape>', '-TCANCEL-')
+    bring_to_front(tw)
+    tw.bind('<Return>', '-APPLY-')
+    tevt, tvals = _read(tw)
+    tw.close()
+    if tevt == '-APPLY-' and tvals.get('-T-'):
+        try:
+            chosen_name = tvals['-T-'][0]
+            tid = next(t['id'] for t in transitions if t['name'] == chosen_name)
+            jira.transition_issue(issue_key, tid)
+            sg.popup_quick_message('Status updated.', auto_close_duration=1,
+                                   background_color='#2e7d32', text_color='white')
+            return True
+        except Exception as exc:
+            show_error(f"API error:\n{exc}", tb=_tb.format_exc())
+    return False
 
-    while True:
-        event, values = _read(window)
-        if event in (sg.WIN_CLOSED, '-CANCEL-'):
-            break
 
-        sel = values.get('-LIST-')
-        if not sel:
-            sg.popup('Select a ticket first.', modal=True, keep_on_top=True)
-            continue
+def _bulk_transition(jira: JiraClient, issues: list[dict],
+                     target_status: str) -> tuple[int, list[str]]:
+    """Transition every issue to ``target_status``. Returns (ok_count, failures)."""
+    ok, failures, tl = 0, [], target_status.lower()
+    for i in issues:
+        key = i['key']
+        try:
+            trans = jira.get_transitions(key)
+            match = (next((t for t in trans if t['name'].lower() == tl), None)
+                     or next((t for t in trans if tl in t['name'].lower()), None))
+            if match is None:
+                failures.append(f"{key}: no '{target_status}' transition")
+                continue
+            jira.transition_issue(key, match['id'])
+            ok += 1
+        except Exception as exc:
+            failures.append(f"{key}: {exc}")
+    return ok, failures
 
-        idx = labels.index(sel[0])
-        issue_key = issues[idx]['key']
 
-        if event == '-COMMENT-':
-            comment = sg.popup_get_text(f'Comment for {issue_key}:', title='Add Comment',
-                                        size=(60, 1))
-            if comment:
+def _bulk_done_popup(issues: list[dict], done_status: str) -> list[dict] | None:
+    """Checklist to confirm/trim which tickets move to ``done_status``. All start
+    checked; the user unchecks anything not actually complete. Returns the chosen
+    issues, or None if cancelled."""
+    rows = [[sg.Checkbox(f"{i['key']}  {i['fields']['summary']}", default=True,
+                         key=f"-CB-{i['key']}-")] for i in issues]
+    body = sg.Column(rows, scrollable=len(issues) > 12, vertical_scroll_only=True,
+                     size=(560, min(len(issues) * 24 + 12, 340)))
+    layout = [
+        [sg.Text(f'Move selected tickets to "{done_status}"',
+                 font=('Helvetica', 12, 'bold'))],
+        [sg.Text('All are checked by default — uncheck any that are not complete.',
+                 font=('Helvetica', 9))],
+        [body],
+        [sg.Push(),
+         sg.Button('Move selected', key='-GO-'),
+         sg.Button('Cancel', key='-C-')],
+    ]
+    w = sg.Window('Bulk → Done', layout, finalize=True, modal=True, keep_on_top=True)
+    w.bind('<Escape>', '-C-')
+    bring_to_front(w)
+    ev, vals = _read(w)
+    w.close()
+    if ev != '-GO-':
+        return None
+    return [i for i in issues if vals.get(f"-CB-{i['key']}-")]
+
+
+def _manage_options_popup(state: dict) -> bool:
+    """Sort + epic-grouping options for the Manage window. Returns True if applied."""
+    sort_opts = ['(Default: recent)', 'Priority', 'Due date', 'Status', 'Assignee', 'Key']
+    cur = state['sort'] or '(Default: recent)'
+    layout = [
+        [sg.Text('View options', font=('Helvetica', 12, 'bold'))],
+        [sg.Text('Sort by:', size=(9, 1)),
+         sg.Combo(sort_opts, default_value=cur, key='-SORT-', readonly=True, size=(18, 1))],
+        [sg.Checkbox('Descending', default=state['desc'], key='-DESC-')],
+        [sg.Checkbox('Group by epic', default=(state['view'] == 'tree'), key='-GROUP-')],
+        [sg.Push(), sg.Button('Apply', key='-APPLY-'), sg.Button('Cancel', key='-OCANCEL-')],
+    ]
+    w = sg.Window('Options', layout, finalize=True, modal=True, keep_on_top=True)
+    w.bind('<Escape>', '-OCANCEL-')
+    w.bind('<Return>', '-APPLY-')
+    bring_to_front(w)
+    ev, vals = _read(w)
+    w.close()
+    if ev != '-APPLY-':
+        return False
+    s = vals['-SORT-']
+    state['sort'] = None if s.startswith('(Default') else s
+    state['desc'] = bool(vals['-DESC-'])
+    state['view'] = 'tree' if vals['-GROUP-'] else 'flat'
+    return True
+
+
+def _selected_key(values: dict, state: dict, row_keys: list[str]) -> str | None:
+    """Resolve the selected issue key in either flat (table) or tree view. Epic
+    header rows (keys prefixed 'EPIC::') are treated as no selection."""
+    if state['view'] == 'tree':
+        for k in (values.get('-TREE-') or []):
+            if not str(k).startswith('EPIC::'):
+                return k
+        return None
+    rows = values.get('-TABLE-') or []
+    if rows and 0 <= rows[0] < len(row_keys):
+        return row_keys[rows[0]]
+    return None
+
+
+def _show_release_view(cache: Cache, jira: JiraClient, config: dict) -> None:
+    """Release-coordinator mode: all users' tickets in the configured release status,
+    with copy-keys / copy-users / bulk-move-to-done."""
+    proj = config['jira']['project_key']
+    epic_cf = _epic_link_cf(config)
+    rel = config.get('release') or {}
+    filter_status = (rel.get('filter_status') or '').strip()
+    done_status = (rel.get('done_status') or '').strip()
+    if not filter_status or not done_status:
+        show_error('Release statuses are not configured.\n\nSet a Pre-Release Status and a '
+                   'Completed status in Config → App Settings → Release settings, then click '
+                   '"Test statuses".', title='Release not configured')
+        return
+
+    def _fetch() -> list[dict]:
+        items = jira.get_sprint_issues(proj, mine=False, status=filter_status,
+                                       epic_link_cf=epic_cf)
+        # Guard against a status name the JQL matched loosely.
+        return [i for i in items if _i_status(i).lower() == filter_status.lower()]
+
+    try:
+        issues = _fetch()
+    except Exception as exc:
+        show_error(f"Could not fetch release tickets:\n{exc}", tb=_tb.format_exc())
+        return
+
+    while True:  # rebuild after update / bulk move
+        emails = sorted({_i_assignee_email(i) for i in issues})
+        labels = [f"{i['key']:12s} {_i_assignee(i):22s} {i['fields']['summary']}"
+                  for i in issues]
+        layout = [
+            [sg.Text(f'Release mode — status "{filter_status}"',
+                     font=('Helvetica', 12, 'bold'))],
+            [sg.Text(f'{len(issues)} ticket(s) · {len(emails)} user(s)')],
+            [sg.Listbox(labels, size=(80, min(len(issues) + 1, 16)), key='-RLIST-',
+                        select_mode=sg.LISTBOX_SELECT_MODE_BROWSE)],
+            [sg.Push(),
+             sg.Button('Copy Keys',  key='-CKEYS-'),
+             sg.Button('Copy Users', key='-CUSERS-'),
+             sg.Button(f'Bulk → {done_status}', key='-BULK-'),
+             sg.Button('Update', key='-RUPDATE-'),
+             sg.Button('Back',   key='-BACK-')],
+        ]
+        window = sg.Window('Release Mode', layout, finalize=True, modal=True, keep_on_top=True)
+        window.bind('<Escape>', '-BACK-')
+        bring_to_front(window)
+        if issues:
+            _soft_select(window, 0, key='-RLIST-')
+
+        rebuild = False
+        while not rebuild:
+            event, values = _read(window)
+            if event in (sg.WIN_CLOSED, '-BACK-'):
+                window.close()
+                return
+            if event == '-CKEYS-':
+                _to_clipboard(window, ', '.join(i['key'] for i in issues))
+                sg.popup_quick_message('Keys copied.', auto_close_duration=1,
+                                       background_color='#2e7d32', text_color='white')
+            elif event == '-CUSERS-':
+                _to_clipboard(window, ', '.join(emails))
+                sg.popup_quick_message('Users copied.', auto_close_duration=1,
+                                       background_color='#2e7d32', text_color='white')
+            elif event == '-RUPDATE-':
                 try:
-                    jira.add_comment(issue_key, comment)
-                    sg.popup_quick_message('Comment added.', auto_close_duration=1,
-                                           background_color='#2e7d32', text_color='white')
+                    issues = _fetch()
                 except Exception as exc:
-                    show_error(f"API error:\n{exc}", tb=_tb.format_exc())
+                    show_error(f"Update failed:\n{exc}", tb=_tb.format_exc())
+                rebuild = True
+            elif event == '-BULK-':
+                if not issues:
+                    sg.popup('Nothing to move.', modal=True, keep_on_top=True)
+                    continue
+                selected = _bulk_done_popup(issues, done_status)
+                if not selected:
+                    continue
+                ok, failures = _bulk_transition(jira, selected, done_status)
+                msg = f"Moved {ok} ticket(s) to {done_status}."
+                if failures:
+                    msg += f"\n\n{len(failures)} failed:\n  " + '\n  '.join(failures)
+                sg.popup(msg, title='Bulk transition', modal=True, keep_on_top=True)
+                try:
+                    issues = _fetch()
+                except Exception:
+                    pass
+                rebuild = True
+        window.close()
 
-        elif event == '-STATUS-':
+
+def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
+    """Manage the active sprint's tickets assigned to me. Opens from the on-disk
+    snapshot (Update refetches); supports sort + epic grouping (Options), subtask
+    creation, and release-coordinator mode."""
+    proj = config['jira']['project_key']
+    epic_cf = _epic_link_cf(config)
+
+    def _fetch() -> list[dict]:
+        return jira.get_sprint_issues(proj, mine=True, epic_link_cf=epic_cf)
+
+    snap = cache.load_sprint_issues()
+    if snap is None:
+        try:
+            issues = _fetch()
+        except Exception as exc:
+            show_error(f"Could not fetch sprint tickets:\n{exc}", tb=_tb.format_exc())
+            return
+        cache.save_sprint_issues(issues)
+        fetched = 'just now'
+    else:
+        issues = snap['issues']
+        fetched = (snap.get('fetched_at') or '')[:19].replace('T', ' ')
+
+    state = {'issues': issues, 'view': 'flat', 'sort': None, 'desc': False,
+             'fetched': fetched}
+
+    k_comment = _sc(config, 'comment', 'c')
+    k_status  = _sc(config, 'status', 's')
+    k_subtask = _sc(config, 'subtask', 't')
+    k_update  = _sc(config, 'update', 'u')
+
+    while True:  # (re)build the window after Update / Options
+        ordered = _sort_issues(state['issues'], state['sort'], state['desc'])
+        sub_line = f"updated {state['fetched']}" if state['fetched'] else ''
+        row_keys = [i['key'] for i in ordered]
+
+        if state['view'] == 'tree':
+            td = sg.TreeData()
+            groups: dict = {}
+            group_order: list = []
+            for i in ordered:
+                ek, elabel = _i_epic(i, epic_cf)
+                gk = ek or '__none__'
+                if gk not in groups:
+                    groups[gk] = [elabel or '(No Epic)', []]
+                    group_order.append(gk)
+                groups[gk][1].append(i)
+            for gk in group_order:
+                glabel, its = groups[gk]
+                td.insert('', f'EPIC::{gk}', glabel, values=['', ''])
+                for i in its:
+                    td.insert(f'EPIC::{gk}', i['key'], f"{i['key']}  {i['fields']['summary']}",
+                              values=[_i_status(i), _i_due(i)])
+            n_rows = min(len(ordered) + len(group_order) + 1, 18)
+            list_elem = sg.Tree(data=td, headings=['Status', 'Due'],
+                                col0_heading='Epic / Ticket', col0_width=46,
+                                col_widths=[12, 10], auto_size_columns=False,
+                                key='-TREE-', num_rows=max(n_rows, 4),
+                                select_mode=sg.TABLE_SELECT_MODE_BROWSE,
+                                show_expanded=True, enable_events=False, justification='left')
+        else:
+            table_rows = []
+            for i in ordered:
+                ek, _ = _i_epic(i, epic_cf)
+                table_rows.append([i['key'], i['fields']['summary'],
+                                   ek or '', _i_due(i)])
+            list_elem = sg.Table(values=table_rows,
+                                 headings=['Key', 'Summary', 'Epic', 'Due'],
+                                 col_widths=[11, 40, 12, 11], auto_size_columns=False,
+                                 justification='left', key='-TABLE-',
+                                 num_rows=min(len(ordered) + 1, 16),
+                                 select_mode=sg.TABLE_SELECT_MODE_BROWSE,
+                                 enable_events=False, expand_x=True,
+                                 hide_vertical_scroll=len(ordered) <= 16)
+
+        _release_ok = bool((config.get('release') or {}).get('validated'))
+        layout = [
+            [sg.Text(f'Current Sprint — mine ({len(ordered)})',
+                     font=('Helvetica', 12, 'bold')),
+             sg.Push(), sg.Text(sub_line, font=('Helvetica', 8)),
+             sg.Button('Release', key='-RELEASE-', size=(10, 1),
+                       disabled=not _release_ok,
+                       tooltip=None if _release_ok else
+                       'Validate the release statuses in Config → Release settings first'),
+             sg.Button('☰', key='-OPTIONS-', size=(3, 1), tooltip='Sort / group options')],
+            [list_elem],
+            [sg.Push(),
+             sg.Button(f'({k_comment.upper()}) Comment', key='-COMMENT-'),
+             sg.Button(f'({k_status.upper()}) Status',   key='-STATUS-'),
+             sg.Button(f'({k_subtask.upper()}) Subtask', key='-SUBTASK-'),
+             sg.Button(f'({k_update.upper()}) Update',   key='-UPDATE-'),
+             sg.Button('(X) Close', key='-CANCEL-')],
+        ]
+        window = sg.Window('Manage Tickets', layout, finalize=True)
+        window.bind('<Escape>', '-CANCEL-')
+        bring_to_front(window)
+        for ch, ev in [(k_comment, '-COMMENT-'), (k_status, '-STATUS-'),
+                       (k_subtask, '-SUBTASK-'), (k_update, '-UPDATE-'),
+                       ('x', '-CANCEL-')]:
+            window.bind(ch.lower(), ev)
+            window.bind(ch.upper(), ev)
+        if ordered:
+            elem = window['-TABLE-' if state['view'] == 'flat' else '-TREE-']
+            if state['view'] == 'flat':
+                elem.update(select_rows=[0])
             try:
-                transitions = jira.get_transitions(issue_key)
-                t_names = [t['name'] for t in transitions]
-                layout_s = [
-                    [sg.Text(f'Transitions for {issue_key}', font=('Helvetica', 11, 'bold'))],
-                    [sg.Listbox(t_names, size=(40, min(len(t_names) + 1, 8)),
-                                key='-T-', select_mode=sg.LISTBOX_SELECT_MODE_SINGLE)],
-                    [sg.Button('Apply', key='-APPLY-'), sg.Button('Cancel', key='-TCANCEL-')],
-                ]
-                tw = sg.Window('Change Status', layout_s, finalize=True, modal=True)
-                tw.bind('<Escape>', '-TCANCEL-')
-                bring_to_front(tw)
-                tw.bind('<Return>', '-APPLY-')
-                tevt, tvals = _read(tw)
-                tw.close()
-                if tevt == '-APPLY-' and tvals.get('-T-'):
-                    chosen_name = tvals['-T-'][0]
-                    tid = next(t['id'] for t in transitions if t['name'] == chosen_name)
-                    jira.transition_issue(issue_key, tid)
-                    sg.popup_quick_message('Status updated.', auto_close_duration=1,
-                                           background_color='#2e7d32', text_color='white')
-            except Exception as exc:
-                show_error(f"API error:\n{exc}", tb=_tb.format_exc())
+                elem.Widget.focus_set()
+            except Exception:
+                pass
 
-    window.close()
+        rebuild = False
+        while not rebuild:
+            event, values = _read(window)
+            if event in (sg.WIN_CLOSED, '-CANCEL-'):
+                window.close()
+                return
+
+            if event == '-UPDATE-':
+                try:
+                    state['issues'] = _fetch()
+                    cache.save_sprint_issues(state['issues'])
+                    state['fetched'] = datetime.now().isoformat()[:19].replace('T', ' ')
+                except Exception as exc:
+                    show_error(f"Update failed:\n{exc}", tb=_tb.format_exc())
+                rebuild = True
+                continue
+
+            if event == '-OPTIONS-':
+                if _manage_options_popup(state):
+                    rebuild = True
+                continue
+
+            if event == '-RELEASE-':
+                window.hide()
+                _show_release_view(cache, jira, config)
+                window.un_hide()
+                bring_to_front(window)
+                continue
+
+            issue_key = _selected_key(values, state, row_keys)
+            if not issue_key:
+                sg.popup('Select a ticket first.', modal=True, keep_on_top=True)
+                continue
+
+            if event == '-COMMENT-':
+                comment = sg.popup_get_text(f'Comment for {issue_key}:',
+                                            title='Add Comment', size=(60, 1))
+                if comment:
+                    try:
+                        jira.add_comment(issue_key, comment)
+                        sg.popup_quick_message('Comment added.', auto_close_duration=1,
+                                               background_color='#2e7d32', text_color='white')
+                    except Exception as exc:
+                        show_error(f"API error:\n{exc}", tb=_tb.format_exc())
+            elif event == '-STATUS-':
+                _change_status(jira, issue_key)
+            elif event == '-SUBTASK-':
+                window.hide()
+                show_new_ticket_flow(cache, jira, config, parent_key=issue_key)
+                window.un_hide()
+                bring_to_front(window)
+
+        window.close()
 
 
 # ─── Main window ─────────────────────────────────────────────────────────────
@@ -375,25 +866,27 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
             pass
         elif event == '-NEW-':
             window.hide()
-            ticket_type = show_type_selector()
-            if ticket_type:
-                ticket = TICKET_CLASSES[ticket_type]()
-                show_ticket_form(ticket, cache, jira, config)
+            show_new_ticket_flow(cache, jira, config)
             window.un_hide()
             bring_to_front(window)
 
         elif event == '-DRAFTS-':
             window.hide()
-            drafts = cache.drafts()
-            chosen = show_draft_list(drafts, cache)
-            if chosen:
+            # Loop so that opening a draft and leaving its form returns to the
+            # drafts list (not the main window); break out only when the list is
+            # cancelled or empty.
+            while True:
+                drafts = cache.drafts()
+                chosen = show_draft_list(drafts, cache, config)
+                if not chosen:
+                    break
                 show_ticket_form(chosen, cache, jira, config)
             window.un_hide()
             bring_to_front(window)
 
         elif event == '-MANAGE-':
             window.hide()
-            show_interaction_window(jira, config)
+            show_interaction_window(cache, jira, config)
             window.un_hide()
             bring_to_front(window)
 
@@ -401,10 +894,11 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
             window.hide()
             updated = show_config_window(config, config_path)
             if updated:
+                from .main import data_dir
                 config = updated
                 sg.theme(config.get('ui', {}).get('theme', 'DarkBlue3'))
                 jira = JiraClient.from_config(config)
-                cache = Cache(config.get('cache', {}).get('directory', '~/.jira_tool/cache'))
+                cache = Cache(str(data_dir(config)))
             window.un_hide()
             bring_to_front(window)
 

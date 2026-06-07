@@ -29,6 +29,8 @@ from .ui import run_main_window, show_interaction_window
 # do not belong there. The legacy in-package location is migrated on first run.
 CONFIG_PATH = Path.home() / '.jiramaxx' / 'config.yaml'
 LEGACY_CONFIG_PATH = Path(__file__).parent / 'config.yaml'
+# Old scattered drafts location, retired in favor of one folder under base_dir.
+LEGACY_CACHE_DIR = Path.home() / '.jira_tool' / 'cache'
 
 DEFAULT_CONFIG: dict = {
     'jira': {
@@ -40,11 +42,31 @@ DEFAULT_CONFIG: dict = {
         'token_type': 'classic',
         'cloud_id': '',
     },
-    'cache': {'directory': '~/.jira_tool/cache'},
+    # One folder holds config.yaml, drafts, and sprint snapshots so users can move
+    # or clear everything at once. Drafts → <base_dir>/drafts, sprint snapshots →
+    # <base_dir>/drafts/sprints, config.yaml stays at ~/.jiramaxx/config.yaml.
+    'paths': {'base_dir': '~/.jiramaxx'},
     'ui': {'theme': 'DarkBlue3'},
     'hotkeys': {
         'create_ticket': 'ctrl+alt+j',
         'manage_tickets': 'ctrl+alt+m',
+    },
+    # In-window key bindings (apply on next window open). Only the frequent
+    # per-ticket actions get a shortcut; view options live behind buttons.
+    'shortcuts': {
+        'comment': 'c',
+        'status': 's',
+        'subtask': 't',
+        'update': 'u',
+    },
+    # Release mode: the status it filters to, and the status it bulk-moves to.
+    # Configurable so it adapts to different workflows.
+    'release': {
+        'filter_status': 'Ready for Release',
+        'done_status': 'Done',
+        # Set true only by Config → Release settings → "Test statuses"; Release mode
+        # stays disabled until both statuses are confirmed to exist in the project.
+        'validated': False,
     },
     'network': {
         'use_system_certs': True,
@@ -52,6 +74,29 @@ DEFAULT_CONFIG: dict = {
         'proxy': '',
     },
 }
+
+
+def data_dir(config: dict) -> Path:
+    """Resolve the drafts directory. Honors an explicit, non-legacy
+    ``cache.directory`` for back-compat; otherwise derives ``<base_dir>/drafts``."""
+    explicit = (config.get('cache') or {}).get('directory')
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p != LEGACY_CACHE_DIR:
+            return p
+    base = (config.get('paths') or {}).get('base_dir') or '~/.jiramaxx'
+    return Path(base).expanduser() / 'drafts'
+
+
+def migrate_legacy_cache(target: Path) -> None:
+    """One-time relocation of old ~/.jira_tool/cache drafts into the new folder."""
+    if target.exists() or not LEGACY_CACHE_DIR.exists():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(LEGACY_CACHE_DIR), str(target))
+    except Exception:
+        pass
 
 
 def enable_system_certs(config: dict) -> None:
@@ -105,7 +150,9 @@ def _prompt_setup(config: dict) -> dict:
 
 
 def build_clients(config: dict) -> tuple[Cache, JiraClient]:
-    cache = Cache(config.get('cache', {}).get('directory', '~/.jira_tool/cache'))
+    ddir = data_dir(config)
+    migrate_legacy_cache(ddir)
+    cache = Cache(str(ddir))
     jira = JiraClient.from_config(config)
     return cache, jira
 
@@ -148,7 +195,7 @@ def main():
                 if action == 'main':
                     run_main_window(cache, jira, config, CONFIG_PATH)
                 elif action == 'manage':
-                    show_interaction_window(jira, config)
+                    show_interaction_window(cache, jira, config)
             finally:
                 gui_busy.release()
 
