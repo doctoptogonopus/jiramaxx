@@ -8,6 +8,13 @@ from requests.auth import HTTPBasicAuth
 _PROXY_ENV_VARS = ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')
 
 
+def _jql_str(value: str) -> str:
+    """Escape a value for use inside a double-quoted JQL string literal, so a
+    project key or status name containing a backslash or quote can't break (or
+    inject into) the query. Backslash first, then the quote."""
+    return str(value).replace('\\', '\\\\').replace('"', '\\"')
+
+
 def apply_proxy_env(network: dict | None) -> None:
     """Export a configured ``network.proxy`` to the standard proxy env vars.
 
@@ -95,6 +102,25 @@ class JiraClient:
         self._raise(r)
         return r.json()
 
+    def _search_all(self, jql: str, fields: str, page_size: int = 100,
+                    max_total: int = 2000) -> list[dict]:
+        """Run a JQL search across all pages. The enhanced `/search/jql` endpoint
+        returns a ``nextPageToken`` while more results remain; follow it until it's
+        gone (or a safety cap is hit) so large sprints aren't silently truncated."""
+        issues: list[dict] = []
+        token: str | None = None
+        while True:
+            params = {'jql': jql, 'maxResults': page_size, 'fields': fields}
+            if token:
+                params['nextPageToken'] = token
+            data = self._get('/rest/api/3/search/jql', params)
+            batch = data.get('issues', [])
+            issues.extend(batch)
+            token = data.get('nextPageToken')
+            if not token or not batch or len(issues) >= max_total:
+                break
+        return issues
+
     def _post(self, path: str, body: dict) -> dict:
         r = self.session.post(f"{self.base}{path}", json=body)
         self._raise(r)
@@ -138,33 +164,26 @@ class JiraClient:
         (used by Release mode). Extra fields (duedate, parent, epic link) are
         requested so the UI can sort and group without follow-up calls.
         """
-        clauses = [f'project="{project_key}"', 'sprint in openSprints()']
+        clauses = [f'project="{_jql_str(project_key)}"', 'sprint in openSprints()']
         if mine:
             clauses.append('assignee = currentUser()')
         if status:
-            clauses.append(f'status = "{status}"')
+            clauses.append(f'status = "{_jql_str(status)}"')
         jql = ' AND '.join(clauses) + ' ORDER BY updated DESC'
         fields = ['summary', 'status', 'assignee', 'issuetype', 'priority',
                   'duedate', 'parent']
         if epic_link_cf:
             fields.append(epic_link_cf)
-        data = self._get('/rest/api/3/search/jql', {
-            'jql': jql,
-            'maxResults': 100,
-            'fields': ','.join(fields),
-        })
-        return data.get('issues', [])
+        return self._search_all(jql, ','.join(fields))
 
     def get_sprints(self, project_key: str, sprint_cf: str = 'customfield_10020') -> list[dict]:
         """Extract sprint metadata from issue fields — no Agile API scope required."""
-        data = self._get('/rest/api/3/search/jql', {
-            'jql': f'project="{project_key}" AND sprint not in closedSprints() ORDER BY updated DESC',
-            'maxResults': 100,
-            'fields': sprint_cf,
-        })
+        jql = (f'project="{_jql_str(project_key)}" '
+               'AND sprint not in closedSprints() ORDER BY updated DESC')
+        issues = self._search_all(jql, sprint_cf)
         seen: set[int] = set()
         sprints: list[dict] = []
-        for issue in data.get('issues', []):
+        for issue in issues:
             for s in (issue.get('fields', {}).get(sprint_cf) or []):
                 if isinstance(s, dict) and s.get('id') not in seen:
                     seen.add(s['id'])
@@ -174,6 +193,18 @@ class JiraClient:
         order = {'active': 0, 'future': 1}
         return [s for s in sorted(sprints, key=lambda x: order.get(x['state'], 99))
                 if s['state'] in ('active', 'future')]
+
+    def get_project_statuses(self, project_key: str) -> set[str]:
+        """Lowercased set of every status name available across the project's
+        issue-type workflows. Used to validate the configured release statuses."""
+        data = self._get(f'/rest/api/3/project/{project_key}/statuses')
+        names: set[str] = set()
+        for itype in (data if isinstance(data, list) else []):
+            for st in itype.get('statuses', []):
+                name = st.get('name')
+                if name:
+                    names.add(name.lower())
+        return names
 
     def get_myself(self) -> dict:
         return self._get('/rest/api/3/myself')

@@ -64,6 +64,9 @@ DEFAULT_CONFIG: dict = {
     'release': {
         'filter_status': 'Ready for Release',
         'done_status': 'Done',
+        # Set true only by Config → Release settings → "Test statuses"; Release mode
+        # stays disabled until both statuses are confirmed to exist in the project.
+        'validated': False,
     },
     'network': {
         'use_system_certs': True,

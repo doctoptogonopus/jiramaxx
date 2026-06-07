@@ -29,6 +29,7 @@ shortcuts:
 release:
   filter_status: Ready for Release
   done_status: Done
+  validated: false
 ticket_types:
   Story:
     required:

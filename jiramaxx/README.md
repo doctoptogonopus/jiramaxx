@@ -244,6 +244,13 @@ Click the **☰** button in the top-right corner to:
 
 ### Release mode
 
+> **Release mode is disabled until you validate your statuses.** In Config → App Settings →
+> Release settings, click **Test statuses** — it confirms your Pre-Release and Completed
+> status names actually exist in the project. Only after that passes does the **Release**
+> button become enabled. (Editing either status afterwards disables it again until you
+> re-test.) If a status is left blank, Release mode shows a "not configured" error rather
+> than an empty list.
+
 Click **Release** for a coordinator view of everyone's tickets in the active sprint that are in a chosen status (default **"Ready for Release"**, configurable — see Widget Settings). From here you can:
 
 - **Copy Keys** — copy all matching ticket keys to the clipboard as a **comma-separated** list.
@@ -277,6 +284,7 @@ Under **Release settings** (own section at the bottom of the tab):
 |---|---|
 | **Pre-Release Status** | The status Release mode filters the sprint to. Default: `Ready for Release`. Set this to match your workflow. |
 | **Completed / Post-Release Status** | The status Release mode's "Bulk → Done" transitions tickets to. Default: `Done`. |
+| **Test statuses** | Confirms both statuses above exist in the project. Release mode stays disabled until this passes; editing a status disables it again until re-tested. |
 
 Theme changes take effect the next time you open a window. Global hotkeys require a daemon restart; in-window shortcuts apply the next time you open that window.
 
@@ -346,6 +354,7 @@ shortcuts:                  # in-window single-key shortcuts (apply on next open
 release:                    # release-coordinator mode (Manage → Release)
   filter_status: Ready for Release   # status it lists
   done_status:   Done                # status "Bulk → Done" transitions to
+  validated:     false               # set by "Test statuses"; Release disabled until true
 
 network:
   use_system_certs: true   # trust OS-installed (corporate) root CAs

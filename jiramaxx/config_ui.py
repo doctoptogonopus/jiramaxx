@@ -218,7 +218,16 @@ def _app_tab(config: dict) -> list:
         rows.append([sg.Text(label, size=(30, 1)),
                      sg.Input(_nested_get_d(config, key), key=f'-CFG-{key}-',
                               size=(26, 1), enable_events=True)])
+    rows.append([sg.Button('Test statuses', key='-TEST-RELEASE-'),
+                 sg.Text(_release_status_text(config), key='-RELEASE-STATUS-',
+                         font=('Helvetica', 9))])
     return rows
+
+
+def _release_status_text(config: dict) -> str:
+    validated = bool((config.get('release') or {}).get('validated'))
+    return ('✓ statuses validated — Release mode enabled' if validated
+            else 'Not validated — Release mode is disabled until you Test the statuses')
 
 
 def _types_tab(type_fields: dict, current_type: str) -> list:
@@ -657,6 +666,49 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                 except Exception as exc:
                     import traceback
                     show_error(f"Could not fetch sprints:\n{exc}", tb=traceback.format_exc())
+
+        # ── Test release statuses ──────────────────────────────────────────
+        elif event == '-TEST-RELEASE-':
+            proj  = values.get('-CFG-jira.project_key-', '').strip()
+            token = values.get('-CFG-jira.api_token-', '').strip()
+            pre   = values.get('-CFG-release.filter_status-', '').strip()
+            done  = values.get('-CFG-release.done_status-', '').strip()
+            if not all([token, proj]):
+                sg.popup('Fill in API Token and Project Key first.',
+                         title='Test statuses', modal=True, keep_on_top=True)
+            elif not (pre and done):
+                sg.popup('Set both the Pre-Release and Completed statuses first.',
+                         title='Test statuses', modal=True, keep_on_top=True)
+            elif not _cloud_id_ok(values):
+                pass
+            else:
+                try:
+                    names = _make_client(values).get_project_statuses(proj)
+                    missing = [s for s in (pre, done) if s.lower() not in names]
+                    working.setdefault('release', {})['validated'] = not missing
+                    window['-RELEASE-STATUS-'].update(_release_status_text(working))
+                    if not missing:
+                        sg.popup(f"Both statuses exist in '{proj}'. Release mode enabled.\n\n"
+                                 "Note: this only confirms the statuses exist — whether "
+                                 "'Bulk → Done' can reach the completed status still depends "
+                                 "on each ticket's current workflow position.",
+                                 title='Statuses validated', modal=True, keep_on_top=True)
+                    else:
+                        sg.popup("These status name(s) were not found in the project:\n  "
+                                 + '\n  '.join(missing)
+                                 + "\n\nCheck spelling/case against your Jira workflow. "
+                                   "Release mode stays disabled.",
+                                 title='Status not found', modal=True, keep_on_top=True)
+                except Exception as exc:
+                    import traceback
+                    show_error(f"Could not fetch project statuses:\n{exc}",
+                               tb=traceback.format_exc())
+
+        # ── Editing a release status invalidates the prior Test ────────────
+        elif event in ('-CFG-release.filter_status-', '-CFG-release.done_status-'):
+            if (working.get('release') or {}).get('validated'):
+                working.setdefault('release', {})['validated'] = False
+                window['-RELEASE-STATUS-'].update(_release_status_text(working))
 
         # ── Save ───────────────────────────────────────────────────────────
         elif event == '-SAVE-':

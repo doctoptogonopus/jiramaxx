@@ -547,8 +547,13 @@ def _show_release_view(cache: Cache, jira: JiraClient, config: dict) -> None:
     proj = config['jira']['project_key']
     epic_cf = _epic_link_cf(config)
     rel = config.get('release') or {}
-    filter_status = (rel.get('filter_status') or 'Ready for Release').strip()
-    done_status = (rel.get('done_status') or 'Done').strip()
+    filter_status = (rel.get('filter_status') or '').strip()
+    done_status = (rel.get('done_status') or '').strip()
+    if not filter_status or not done_status:
+        show_error('Release statuses are not configured.\n\nSet a Pre-Release Status and a '
+                   'Completed status in Config → App Settings → Release settings, then click '
+                   '"Test statuses".', title='Release not configured')
+        return
 
     def _fetch() -> list[dict]:
         items = jira.get_sprint_issues(proj, mine=False, status=filter_status,
@@ -700,11 +705,15 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
                                  enable_events=False, expand_x=True,
                                  hide_vertical_scroll=len(ordered) <= 16)
 
+        _release_ok = bool((config.get('release') or {}).get('validated'))
         layout = [
             [sg.Text(f'Current Sprint — mine ({len(ordered)})',
                      font=('Helvetica', 12, 'bold')),
              sg.Push(), sg.Text(sub_line, font=('Helvetica', 8)),
-             sg.Button('Release', key='-RELEASE-', size=(10, 1)),
+             sg.Button('Release', key='-RELEASE-', size=(10, 1),
+                       disabled=not _release_ok,
+                       tooltip=None if _release_ok else
+                       'Validate the release statuses in Config → Release settings first'),
              sg.Button('☰', key='-OPTIONS-', size=(3, 1), tooltip='Sort / group options')],
             [list_elem],
             [sg.Push(),
