@@ -663,20 +663,20 @@ all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
 [[package]]
 name = "jiramaxx-recording"
-version = "1.0.0"
+version = "1.1.0"
 description = "Optional meeting-recording + local transcription plugin for jiramaxx"
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "extra == \"recording\""
 files = [
-    {file = "jiramaxx_recording-1.0.0-py3-none-any.whl", hash = "sha256:44de5c00a2f46edcec85d811982e945d67010a523a8d68bfae9f9bada58a1757"},
-    {file = "jiramaxx_recording-1.0.0.tar.gz", hash = "sha256:6db4e7a804fda7a992e24298771c1dd363ee6ed7a4bdadd6b3c9716cb5b6c4b6"},
+    {file = "jiramaxx_recording-1.1.0-py3-none-any.whl", hash = "sha256:5f2863a2c33a0fe83903170c8bc3f87fdf39bf7859508d91a497cad64b736083"},
+    {file = "jiramaxx_recording-1.1.0.tar.gz", hash = "sha256:2bb7505d498d546d8db5e14cf0869e4b166f593488c094c77d81cfc421fa9b48"},
 ]
 
 [package.dependencies]
 faster-whisper = ">=1.0.0"
-jiramaxx = ">=1.0.0"
+jiramaxx = ">=1.1.0"
 numpy = ">=1.24"
 soundcard = ">=0.4.2"
 
@@ -4807,4 +4807,4 @@ recording = ["jiramaxx-recording"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10"
-content-hash = "0a3bef4834eb3711ccd023bf85d8a0dd5af3bead12a854ff4399bd98efa8192d"
+content-hash = "0c81a62a6ad572e1c1fcee2f511f2221c2da312e432b709683009a021a49df40"

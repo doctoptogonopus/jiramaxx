@@ -130,6 +130,7 @@ Runs silently in the background allowing you to open the widget on demand. Press
 | **N** | Open the ticket type selector, then the ticket form |
 | **D** | Open the draft list (disabled when no drafts exist) |
 | **M** | Open the sprint ticket manager (Add Comment / Change Status) |
+| **G** | Open the **initiative planner** (visual relationship graph) |
 | **C** | Open the configuration editor |
 | **Q** / Escape | Quit |
 
@@ -257,6 +258,68 @@ Click **Release** for a coordinator view of everyone's tickets in the active spr
 - **Copy Users** — copy the unique assignee **emails** to the clipboard (falls back to display name where Jira doesn't expose the email).
 - **Bulk → Done** — opens a **checklist** of the listed tickets (all checked); uncheck any that aren't actually complete, then move the rest to the configured done status (default **"Done"**) in one action.
 - **Update** — refetch; **Back** / Escape returns to the manager.
+
+---
+
+## Planning Initiatives (graph)
+
+Press **G** (Plan Initiative) to open the **initiative planner** — a visual canvas for
+sketching out an epic and the stories/tasks/subtasks under it as a connected graph, *before*
+anything goes to Jira. Everything stays as **local drafts** until you push.
+
+You first see a list of saved plans; **New plan** names a fresh canvas, **Open** reopens one.
+The name you give a new plan also **seeds an Epic node** on the canvas (titled with that name)
+so the initiative starts with an anchor instead of a blank canvas — it's an ordinary draft you
+can edit, fill in, or delete. Plans are stored as YAML under `<data folder>/plans/`.
+
+Nodes still missing **required fields** are flagged on the canvas (a red border and a `⚠`
+prefix); fill them in to clear the flag. A **Push to Jira** is blocked while any node is
+incomplete, and tells you exactly which nodes are missing which fields — nothing is created
+until the whole plan is valid.
+
+On the canvas:
+
+| Action | What it does |
+|---|---|
+| **Add Ticket** | Pick a type and fill the form → a new node on the canvas (a draft, not yet in Jira) |
+| **Add Existing** | Search Jira and drop an existing ticket onto the canvas (read-only, shows its key) |
+| **Drag a node** | Move it around to arrange the graph |
+| **Click a node** | Select it (enables Add Child / Set Parent / Edit / Delete) |
+| **Add Child** | Add a child under the selected node — a **new** draft or an **existing** ticket; it's auto-nested (no relationship prompt) |
+| **Set Parent** | Re-nest the selected node: click **Set Parent**, then click its new parent |
+| **Link mode** | Click a **source** node then a **target** node, then pick a **dependency link** type |
+| **Edit** / **Delete** | Edit the selected node's fields, or remove it (and its connections) |
+| **Save** | Persist the plan to disk (also auto-saved on close) |
+| **Push to Jira** | Create all the draft tickets and their links in Jira (see below) |
+
+Edges are drawn with **arrowheads** so direction is clear (hierarchy points parent → child; a
+link points source → target).
+
+**Relationships** are two distinct things:
+
+- **Hierarchy is inherent** — you never pick "epic vs subtask". When you **Add Child** (or use
+  **Set Parent**), the type is inferred from the parent: an **Epic**'s child is *epic-linked*; any
+  other parent's child is a *subtask*. A node has exactly one parent (re-nesting replaces it).
+- **Dependency links** — *blocks / is blocked by / relates to / duplicates* … (whatever link types
+  your Jira defines), added in **Link mode**. One node can be the target of many (e.g. four tasks
+  that each block a fifth). On push these become real Jira issue links.
+
+**Existing tickets** brought in via **Add Existing** / **Add Child → Existing** are searched live
+(type a key like `PAY-12`, or words to match the summary). They aren't re-created on push; instead,
+if you nest one under a parent, push **updates that issue's parent/epic in Jira**, and any
+dependency links to it are created normally.
+
+### Push to Jira
+
+Creates the draft issues **parents-first** (so a child's epic/parent link resolves), writing each
+new Jira key back onto its node; then **updates** any existing tickets you nested (setting their
+parent/epic), and finally creates the dependency links between everything. It reports how many
+issues were created, existing tickets updated, and links created, and lists any failures (partial
+success is fine — already-created nodes keep their keys, so re-pushing only does the remainder).
+
+> **Disabling the planner.** Set the environment variable `JIRAMAXX_DISABLE_PLANNER` (to any
+> value) to hide the **G** button and shortcut for a given deployment. Unset it to bring the
+> feature back.
 
 ---
 

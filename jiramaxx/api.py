@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import re
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -130,6 +131,13 @@ class JiraClient:
             return {}
         return r.json()
 
+    def _put(self, path: str, body: dict) -> dict:
+        r = self.session.put(f"{self.base}{path}", json=body)
+        self._raise(r)
+        if not r.content:
+            return {}
+        return r.json()
+
     def create_issue(self, payload: dict) -> dict:
         try:
             return self._post('/rest/api/3/issue', payload)
@@ -139,12 +147,45 @@ class JiraClient:
                 f"{exc}\n\n--- Payload sent ---\n{json.dumps(payload, indent=2)}"
             ) from None
 
+    def update_issue(self, issue_key: str, fields: dict) -> dict:
+        """Update fields on an existing issue (PUT). Used by the planner to set an
+        existing ticket's parent / epic link when it's nested under a plan node."""
+        return self._put(f'/rest/api/3/issue/{issue_key}', {'fields': fields})
+
+    def search_issues(self, project_key: str, text: str, max_total: int = 50) -> list[dict]:
+        """Live search for existing issues. A key-looking term (e.g. ``PAY-12``)
+        matches by key; anything else does a summary text search within the project.
+        Returns raw issue dicts (key + summary/issuetype/status fields)."""
+        text = (text or '').strip()
+        if re.match(r'^[A-Za-z][A-Za-z0-9]*-\d+$', text):
+            jql = f'key = "{_jql_str(text)}"'
+        else:
+            jql = (f'project = "{_jql_str(project_key)}" '
+                   f'AND summary ~ "{_jql_str(text)}"')
+        return self._search_all(jql + ' ORDER BY updated DESC',
+                                'summary,issuetype,status', max_total=max_total)
+
     def add_comment(self, issue_key: str, text: str) -> dict:
         return self._post(f'/rest/api/3/issue/{issue_key}/comment', {
             'body': {
                 'type': 'doc', 'version': 1,
                 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': text}]}],
             }
+        })
+
+    def get_issue_link_types(self) -> list[dict]:
+        """Available issue-link types, e.g. {'name':'Blocks','inward':'is blocked by',
+        'outward':'blocks'}. Used by the planner's relationship picker."""
+        return self._get('/rest/api/3/issueLinkType').get('issueLinkTypes', [])
+
+    def create_issue_link(self, inward_key: str, outward_key: str, link_type_name: str):
+        """Create an issue link of ``link_type_name`` where ``outward_key`` is the
+        outward issue and ``inward_key`` is the inward issue (Jira: the outward issue
+        '<outward phrase>' the inward issue)."""
+        self._post('/rest/api/3/issueLink', {
+            'type': {'name': link_type_name},
+            'inwardIssue': {'key': inward_key},
+            'outwardIssue': {'key': outward_key},
         })
 
     def get_transitions(self, issue_key: str) -> list[dict]:

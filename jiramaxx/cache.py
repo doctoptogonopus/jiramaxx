@@ -1,8 +1,21 @@
 from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
+import uuid
 import yaml
 from .models import Ticket, ticket_from_dict
+
+
+def new_plan(name: str, epic_key: str | None = None) -> dict:
+    """A fresh, empty initiative-planner graph (nodes + relationship edges)."""
+    return {
+        'plan_id': uuid.uuid4().hex[:8],
+        'name': name or 'Untitled plan',
+        'epic_key': epic_key,
+        'created_at': datetime.now().isoformat(),
+        'nodes': [],
+        'edges': [],
+    }
 
 
 class Cache:
@@ -13,6 +26,8 @@ class Cache:
         # (i.e. directly under the data folder, alongside transcripts) — also keeps
         # it clear of the draft glob (*.yaml in self.dir, non-recursive).
         self.active_tickets_dir = self.dir.parent / 'active_tickets'
+        # Initiative-planner graphs live in their own sibling folder.
+        self.plans_dir = self.dir.parent / 'plans'
 
     def _path(self, ticket_id: str) -> Path:
         return self.dir / f"{ticket_id}.yaml"
@@ -71,3 +86,47 @@ class Cache:
         except Exception:
             pass
         return None
+
+    # ── Initiative-planner graphs ─────────────────────────────────────────────
+    # One YAML file per plan, holding nodes (embedded draft tickets + canvas
+    # positions) and relationship edges. Self-contained, separate from drafts.
+
+    def _plan_path(self, plan_id: str) -> Path:
+        return self.plans_dir / f"{plan_id}.yaml"
+
+    def save_plan(self, plan: dict) -> None:
+        self.plans_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._plan_path(plan['plan_id']), 'w') as f:
+            yaml.dump(plan, f, default_flow_style=False, sort_keys=False)
+
+    def load_plan(self, plan_id: str) -> dict | None:
+        path = self._plan_path(plan_id)
+        if not path.exists():
+            return None
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f)
+            if data and data.get('plan_id'):
+                return data
+        except Exception:
+            pass
+        return None
+
+    def list_plans(self) -> list[dict]:
+        """All plans, newest first."""
+        plans: list[dict] = []
+        if self.plans_dir.exists():
+            for path in self.plans_dir.glob('*.yaml'):
+                try:
+                    with open(path) as f:
+                        data = yaml.safe_load(f)
+                    if data and data.get('plan_id'):
+                        plans.append(data)
+                except Exception:
+                    pass
+        return sorted(plans, key=lambda p: p.get('created_at', ''), reverse=True)
+
+    def delete_plan(self, plan_id: str) -> None:
+        path = self._plan_path(plan_id)
+        if path.exists():
+            path.unlink()

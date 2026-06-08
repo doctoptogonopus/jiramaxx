@@ -1,7 +1,8 @@
 from __future__ import annotations
 from datetime import datetime
+import os
 import PySimpleGUI as sg
-from .models import Ticket, Task, TICKET_CLASSES, FIELD_META
+from .models import Ticket, Task, TICKET_CLASSES, FIELD_META, ticket_from_dict
 from .cache import Cache
 from .api import JiraClient
 import traceback as _tb
@@ -810,6 +811,10 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
 
     drafts = cache.drafts()
 
+    # Per-deployment lever: hide the initiative planner when this env var is set
+    # (mirrors the recording plugin's JIRAMAXX_DISABLE_RECORDING).
+    planner_enabled = not os.environ.get('JIRAMAXX_DISABLE_PLANNER')
+
     plugins = discover_plugins()
     # Plugins (e.g. jiramaxx-recording) contribute buttons here; if none are
     # installed this row is empty and is omitted from the layout entirely.
@@ -824,6 +829,8 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
                    disabled=len(drafts) == 0)],
         [sg.Button('(M) Manage Tickets', key='-MANAGE-', size=(18, 2)),
          sg.Button('(C) Config',         key='-CONFIG-', size=(18, 2))],
+        *([[sg.Button('(G) Plan Initiative', key='-PLAN-',  size=(38, 2))]]
+          if planner_enabled else []),
         [sg.Button('(Q) Quit',           key='-QUIT-',   size=(38, 1))],
     ]
     if plugin_buttons:
@@ -831,11 +838,14 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
     window = sg.Window('Jira Tool', layout, finalize=True)
     window.bind('<Escape>', '-QUIT-')
     bring_to_front(window)
-    for ch, ev in [('n', '-NEW-'), ('N', '-NEW-'),
-                   ('d', '-DRAFTS-'), ('D', '-DRAFTS-'),
-                   ('m', '-MANAGE-'), ('M', '-MANAGE-'),
-                   ('c', '-CONFIG-'), ('C', '-CONFIG-'),
-                   ('q', '-QUIT-'),   ('Q', '-QUIT-')]:
+    bindings = [('n', '-NEW-'), ('N', '-NEW-'),
+                ('d', '-DRAFTS-'), ('D', '-DRAFTS-'),
+                ('m', '-MANAGE-'), ('M', '-MANAGE-'),
+                ('c', '-CONFIG-'), ('C', '-CONFIG-'),
+                ('q', '-QUIT-'),   ('Q', '-QUIT-')]
+    if planner_enabled:
+        bindings += [('g', '-PLAN-'), ('G', '-PLAN-')]
+    for ch, ev in bindings:
         window.bind(ch, ev)
 
     while True:
@@ -887,6 +897,15 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
         elif event == '-MANAGE-':
             window.hide()
             show_interaction_window(cache, jira, config)
+            window.un_hide()
+            bring_to_front(window)
+
+        elif event == '-PLAN-':
+            # Lazy import to avoid an import cycle: planner.py imports shared form
+            # helpers from this module (mirrors the config_ui import below).
+            from .planner import show_plan_picker
+            window.hide()
+            show_plan_picker(cache, jira, config)
             window.un_hide()
             bring_to_front(window)
 
