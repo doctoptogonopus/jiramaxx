@@ -2,11 +2,11 @@ from __future__ import annotations
 from datetime import datetime
 import os
 import PySimpleGUI as sg
-from .models import Ticket, Task, TICKET_CLASSES, FIELD_META, ticket_from_dict
+from .models import Ticket, Task, TICKET_CLASSES, FIELD_META
 from .cache import Cache
 from .api import JiraClient
 import traceback as _tb
-from .utils import safe_read as _read, show_error, bring_to_front
+from .utils import safe_read as _read, show_error, bring_to_front, run_with_busy
 from .plugins import discover_plugins
 
 _LABEL_W = 22
@@ -84,6 +84,17 @@ def _sort_issues(issues: list[dict], sort: str | None, descending: bool) -> list
     }
     fn = keyfns.get(sort)
     return sorted(issues, key=fn, reverse=descending) if fn else issues
+
+
+def _busy_fetch(fn, what: str) -> tuple:
+    """Run a Jira call behind the busy modal (see utils.run_with_busy) with the
+    standard error popup. Returns (result, ok) — ok is False on error/cancel."""
+    status, val, tb = run_with_busy(fn, message=f'{what}…')
+    if status == 'ok':
+        return val, True
+    if status == 'error':
+        show_error(f"{what} failed:\n{val}", tb=tb)
+    return None, False
 
 
 def _to_clipboard(window, text: str) -> None:
@@ -461,10 +472,13 @@ def _bulk_transition(jira: JiraClient, issues: list[dict],
         key = i['key']
         try:
             trans = jira.get_transitions(key)
-            match = (next((t for t in trans if t['name'].lower() == tl), None)
-                     or next((t for t in trans if tl in t['name'].lower()), None))
+            # Exact (case-insensitive) name match only — a substring fallback can
+            # silently pick the wrong transition (e.g. "Done" inside "Not Done").
+            match = next((t for t in trans if t['name'].lower() == tl), None)
             if match is None:
-                failures.append(f"{key}: no '{target_status}' transition")
+                avail = ', '.join(t['name'] for t in trans) or 'none'
+                failures.append(f"{key}: no '{target_status}' transition "
+                                f"(available: {avail})")
                 continue
             jira.transition_issue(key, match['id'])
             ok += 1
@@ -562,10 +576,8 @@ def _show_release_view(cache: Cache, jira: JiraClient, config: dict) -> None:
         # Guard against a status name the JQL matched loosely.
         return [i for i in items if _i_status(i).lower() == filter_status.lower()]
 
-    try:
-        issues = _fetch()
-    except Exception as exc:
-        show_error(f"Could not fetch release tickets:\n{exc}", tb=_tb.format_exc())
+    issues, ok = _busy_fetch(_fetch, 'Fetching release tickets')
+    if not ok:
         return
 
     while True:  # rebuild after update / bulk move
@@ -606,10 +618,9 @@ def _show_release_view(cache: Cache, jira: JiraClient, config: dict) -> None:
                 sg.popup_quick_message('Users copied.', auto_close_duration=1,
                                        background_color='#2e7d32', text_color='white')
             elif event == '-RUPDATE-':
-                try:
-                    issues = _fetch()
-                except Exception as exc:
-                    show_error(f"Update failed:\n{exc}", tb=_tb.format_exc())
+                fresh, ok = _busy_fetch(_fetch, 'Updating')
+                if ok:
+                    issues = fresh
                 rebuild = True
             elif event == '-BULK-':
                 if not issues:
@@ -618,15 +629,20 @@ def _show_release_view(cache: Cache, jira: JiraClient, config: dict) -> None:
                 selected = _bulk_done_popup(issues, done_status)
                 if not selected:
                     continue
-                ok, failures = _bulk_transition(jira, selected, done_status)
-                msg = f"Moved {ok} ticket(s) to {done_status}."
+                result, ok = _busy_fetch(
+                    lambda: _bulk_transition(jira, selected, done_status),
+                    'Transitioning tickets')
+                if not ok:
+                    continue
+                moved, failures = result
+                msg = f"Moved {moved} ticket(s) to {done_status}."
                 if failures:
                     msg += f"\n\n{len(failures)} failed:\n  " + '\n  '.join(failures)
                 sg.popup(msg, title='Bulk transition', modal=True, keep_on_top=True)
-                try:
-                    issues = _fetch()
-                except Exception:
-                    pass
+                # Best-effort refresh; the bulk popup already reported the outcome.
+                status, fresh, _ = run_with_busy(_fetch, message='Refreshing…')
+                if status == 'ok':
+                    issues = fresh
                 rebuild = True
         window.close()
 
@@ -643,10 +659,8 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
 
     snap = cache.load_sprint_issues()
     if snap is None:
-        try:
-            issues = _fetch()
-        except Exception as exc:
-            show_error(f"Could not fetch sprint tickets:\n{exc}", tb=_tb.format_exc())
+        issues, ok = _busy_fetch(_fetch, 'Fetching sprint tickets')
+        if not ok:
             return
         cache.save_sprint_issues(issues)
         fetched = 'just now'
@@ -749,12 +763,11 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
                 return
 
             if event == '-UPDATE-':
-                try:
-                    state['issues'] = _fetch()
-                    cache.save_sprint_issues(state['issues'])
+                fresh, ok = _busy_fetch(_fetch, 'Updating sprint tickets')
+                if ok:
+                    state['issues'] = fresh
+                    cache.save_sprint_issues(fresh)
                     state['fetched'] = datetime.now().isoformat()[:19].replace('T', ' ')
-                except Exception as exc:
-                    show_error(f"Update failed:\n{exc}", tb=_tb.format_exc())
                 rebuild = True
                 continue
 
@@ -921,9 +934,12 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
             window.un_hide()
             bring_to_front(window)
 
-        drafts = cache.drafts()
-        window['-MSG-'].update(_draft_msg(len(drafts)))
-        window['-DRAFTS-'].update(disabled=len(drafts) == 0)
+        # Only re-scan the drafts folder after an action that can change it —
+        # not for every keypress/plugin event (it reads every YAML on disk).
+        if handled or event in ('-NEW-', '-DRAFTS-', '-MANAGE-', '-PLAN-'):
+            drafts = cache.drafts()
+            window['-MSG-'].update(_draft_msg(len(drafts)))
+            window['-DRAFTS-'].update(disabled=len(drafts) == 0)
 
     window.close()
     return config

@@ -33,8 +33,8 @@ class Cache:
         return self.dir / f"{ticket_id}.yaml"
 
     def save(self, ticket: Ticket):
-        with open(self._path(ticket.ticket_id), 'w') as f:
-            yaml.dump(ticket.to_dict(), f, default_flow_style=False)
+        with open(self._path(ticket.ticket_id), 'w', encoding='utf-8') as f:
+            yaml.dump(ticket.to_dict(), f, default_flow_style=False, allow_unicode=True)
 
     def delete(self, ticket_id: str):
         p = self._path(ticket_id)
@@ -45,7 +45,7 @@ class Cache:
         tickets = []
         for path in self.dir.glob('*.yaml'):
             try:
-                with open(path) as f:
+                with open(path, encoding='utf-8') as f:
                     data = yaml.safe_load(f)
                 if data:
                     tickets.append(ticket_from_dict(data))
@@ -69,9 +69,9 @@ class Cache:
 
     def save_sprint_issues(self, issues: list[dict]) -> None:
         self.active_tickets_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._active_tickets_path(), 'w') as f:
+        with open(self._active_tickets_path(), 'w', encoding='utf-8') as f:
             yaml.dump({'fetched_at': datetime.now().isoformat(), 'issues': issues},
-                      f, default_flow_style=False, sort_keys=False)
+                      f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     def load_sprint_issues(self) -> dict | None:
         """Return {'fetched_at', 'issues'} from the last snapshot, or None."""
@@ -79,7 +79,7 @@ class Cache:
         if not path.exists():
             return None
         try:
-            with open(path) as f:
+            with open(path, encoding='utf-8') as f:
                 data = yaml.safe_load(f)
             if data and isinstance(data.get('issues'), list):
                 return data
@@ -96,15 +96,16 @@ class Cache:
 
     def save_plan(self, plan: dict) -> None:
         self.plans_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._plan_path(plan['plan_id']), 'w') as f:
-            yaml.dump(plan, f, default_flow_style=False, sort_keys=False)
+        with open(self._plan_path(plan['plan_id']), 'w', encoding='utf-8') as f:
+            yaml.dump(plan, f, default_flow_style=False, sort_keys=False,
+                      allow_unicode=True)
 
     def load_plan(self, plan_id: str) -> dict | None:
         path = self._plan_path(plan_id)
         if not path.exists():
             return None
         try:
-            with open(path) as f:
+            with open(path, encoding='utf-8') as f:
                 data = yaml.safe_load(f)
             if data and data.get('plan_id'):
                 return data
@@ -118,7 +119,7 @@ class Cache:
         if self.plans_dir.exists():
             for path in self.plans_dir.glob('*.yaml'):
                 try:
-                    with open(path) as f:
+                    with open(path, encoding='utf-8') as f:
                         data = yaml.safe_load(f)
                     if data and data.get('plan_id'):
                         plans.append(data)

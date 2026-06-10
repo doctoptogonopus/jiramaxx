@@ -44,7 +44,7 @@ OR
 jiramaxx --gui
 ```
 
-On first run, a default `config.yaml` is created at **`~/.jiramaxx/config.yaml`** (your home directory — not inside the installed package). The widget requires you to fill in your credentials (see below) and run again, or use the in-widget Config screen. _If an older in-package `config.yaml` exists from a previous version, it is migrated to the new location automatically on first run._
+On first run, a default `config.yaml` is created at **`~/.jiramaxx/config.yaml`** (your home directory — not inside the installed package). The widget requires you to fill in your credentials (see below) and run again, or use the in-widget Config screen. An empty or partially-filled config is fine — missing settings fall back to their defaults and you'll be prompted for the API token.
 _If running with --gui flag, the script will stop running upon exiting rendering shortcuts unavailable._
 
 ### 2. Configure credentials
@@ -57,8 +57,12 @@ Open the Config screen (press **C** on the main window or run `python main.py --
 | **API Token** | Generated at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) |
 | **User Email** | The email address on your Atlassian account |
 | **Project Key** | The short key for your project (e.g. `ENG`, `JCSD`). Use the **Browse** button to find it. |
-| **Board ID** | The numeric ID of your Scrum/Kanban board. Found in the URL when viewing your board: `.../jira/software/projects/XXX/boards/2` — the trailing number is the board ID. |
 | **My Account ID** | Your Atlassian account ID. Found at: Jira → Profile → the ID in the URL, or via `GET /rest/api/3/myself`. Used when assigning tickets to yourself. |
+
+> **Where the token is stored.** On Save, the API token is placed in the **OS credential store**
+> (Windows Credential Manager — per-user, no admin rights needed) and `config.yaml` keeps only the
+> placeholder `@keyring`. If the credential store isn't available (e.g. disabled by group policy),
+> the token is kept in `config.yaml` as before.
 
 #### Finding your Project Key
 
@@ -267,55 +271,78 @@ Press **G** (Plan Initiative) to open the **initiative planner** — a visual ca
 sketching out an epic and the stories/tasks/subtasks under it as a connected graph, *before*
 anything goes to Jira. Everything stays as **local drafts** until you push.
 
-You first see a list of saved plans; **New plan** names a fresh canvas, **Open** reopens one.
-The name you give a new plan also **seeds an Epic node** on the canvas (titled with that name)
-so the initiative starts with an anchor instead of a blank canvas — it's an ordinary draft you
-can edit, fill in, or delete. Plans are stored as YAML under `<data folder>/plans/`.
+You first see a list of saved plans; **New plan** names a fresh canvas, **Open** reopens one, and
+**Open from Jira** loads an *existing* ticket straight from Jira — the issue, its children, and
+the dependency links between them appear as a ready-made graph you can extend **and edit** (see
+*Editing pushed content* below). The name you give a new plan also **seeds an Epic node** on the
+canvas (titled with that name) so the initiative starts with an anchor instead of a blank canvas
+— it's an ordinary draft you can edit, fill in, or delete.
+
+Plans are stored as YAML under `<data folder>/plans/` only **while they hold local work** (draft
+nodes or unpushed links). After a fully successful push the local plan file is **removed** — Jira
+is the source of truth from then on, and **Open from Jira** rebuilds the graph on demand. A graph
+that is purely hydrated from Jira is never written to disk at all.
 
 Nodes still missing **required fields** are flagged on the canvas (a red border and a `⚠`
 prefix); fill them in to clear the flag. A **Push to Jira** is blocked while any node is
 incomplete, and tells you exactly which nodes are missing which fields — nothing is created
 until the whole plan is valid.
 
-On the canvas:
+**Connections are made on the canvas, not with buttons.** Hover any node and four translucent
+arrows appear off its sides (with a little whitespace between the node and each arrow). Click an
+arrow to add a **connected ticket** in that direction: a small dialog asks for the **title** and
+the **relationship** — **Child** is the default; **Parent** and every dependency-link phrase your
+Jira defines (*blocks / is blocked by / relates to /* …) are in the dropdown. From there,
+**Create** continues the normal flow (pick a type, fill the form), or **Import** searches Jira
+(the title you typed pre-fills the search) and drops the existing ticket in instead.
+
+The toolbar is intentionally small:
 
 | Action | What it does |
 |---|---|
-| **Add Ticket** | Pick a type and fill the form → a new node on the canvas (a draft, not yet in Jira) |
-| **Add Existing** | Search Jira and drop an existing ticket onto the canvas (read-only, shows its key) |
-| **Drag a node** | Move it around to arrange the graph |
-| **Click a node** | Select it (enables Add Child / Set Parent / Edit / Delete) |
-| **Add Child** | Add a child under the selected node — a **new** draft or an **existing** ticket; it's auto-nested (no relationship prompt) |
-| **Set Parent** | Re-nest the selected node: click **Set Parent**, then click its new parent |
-| **Link mode** | Click a **source** node then a **target** node, then pick a **dependency link** type |
-| **Edit** / **Delete** | Edit the selected node's fields, or remove it (and its connections) |
-| **Save** | Persist the plan to disk (also auto-saved on close) |
-| **Push to Jira** | Create all the draft tickets and their links in Jira (see below) |
+| **Add Ticket** | Independent node, no relationship: title dialog → **Create** (type + form) or **Import** an existing Jira ticket |
+| **≡ grip (top-right corner)** | Click-hold and drag to **move** the node |
+| **◢ grip (bottom-right corner)** | Click-hold and drag to **resize** the node |
+| **Click a node or a line** | Select it — the node body only selects (it never drags); relationship arrows are selectable too (enables Edit / Delete) |
+| **Edit** | Node selected: edit its fields. Arrow selected: change the relationship type |
+| **Delete** | Node selected: remove it and its connections. Arrow selected: remove just that relationship |
+| **Save** | Persist the plan to disk (also auto-saved on close while it holds local work) |
+| **Push to Jira** | Apply everything — creations, edits, removals — to Jira (see below) |
 
 Edges are drawn with **arrowheads** so direction is clear (hierarchy points parent → child; a
-link points source → target).
+link points source → target). Hierarchy type is still inferred — an **Epic**'s child is
+*epic-linked*, any other parent's child is a *subtask* — and a node has exactly one parent
+(choosing Child/Parent for a node that already has one re-nests it).
 
-**Relationships** are two distinct things:
+### Editing pushed content (two-way)
 
-- **Hierarchy is inherent** — you never pick "epic vs subtask". When you **Add Child** (or use
-  **Set Parent**), the type is inferred from the parent: an **Epic**'s child is *epic-linked*; any
-  other parent's child is a *subtask*. A node has exactly one parent (re-nesting replaces it).
-- **Dependency links** — *blocks / is blocked by / relates to / duplicates* … (whatever link types
-  your Jira defines), added in **Link mode**. One node can be the target of many (e.g. four tasks
-  that each block a fifth). On push these become real Jira issue links.
+Everything on the canvas is editable, including tickets that already exist in Jira:
 
-**Existing tickets** brought in via **Add Existing** / **Add Child → Existing** are searched live
-(type a key like `PAY-12`, or words to match the summary). They aren't re-created on push; instead,
-if you nest one under a parent, push **updates that issue's parent/epic in Jira**, and any
-dependency links to it are created normally.
+- **Fields** — Edit an existing node and save; it gets an orange `✎` border and the *changed
+  fields* are queued. Nothing touches Jira until you Push.
+- **Relationships** — select a pushed arrow and Delete (or Edit to re-type it); the removal is
+  queued the same way. Deleting a node never deletes the Jira ticket — only its relationships.
 
 ### Push to Jira
 
 Creates the draft issues **parents-first** (so a child's epic/parent link resolves), writing each
-new Jira key back onto its node; then **updates** any existing tickets you nested (setting their
-parent/epic), and finally creates the dependency links between everything. It reports how many
-issues were created, existing tickets updated, and links created, and lists any failures (partial
-success is fine — already-created nodes keep their keys, so re-pushing only does the remainder).
+new Jira key back onto its node; then applies queued **field updates**, **relationship
+removals**, and new dependency links. It reports the created keys and everything else it did,
+listing any failures.
+
+> **Review before it happens:** if the push would touch tickets already in Jira, you first get a
+> **visual diff** — the same graph rendered with **green** = will be created, **orange ✎** =
+> fields will update, **green arrows** = new relationships, **red ✕** = relationships being
+> removed — and a **"Push all changes?" Yes/No**. Below the graph, the changes are listed
+> grouped per ticket: the key (or new title) on its own line, each change indented under it
+> (`Summary: 'old' → 'new'`, `Create (Bug)`, `Relationship: …`). Pure-new plans keep the simple
+> confirmation.
+
+- **Everything succeeded** → the local plan file is **deleted**. Jira now holds the whole tree;
+  use **Open from Jira** any time you want to see, extend, or edit it again.
+- **Partial failure** → the plan is kept, with every node, link, edit, and removal that *did*
+  land marked as done. Fix the problem and push again — only the failed remainder is attempted,
+  so nothing is duplicated.
 
 > **Disabling the planner.** Set the environment variable `JIRAMAXX_DISABLE_PLANNER` (to any
 > value) to hide the **G** button and shortcut for a given deployment. Unset it to bring the
@@ -388,10 +415,9 @@ Both hotkeys are configurable in Config → App Settings. Changes require a daem
 ```yaml
 jira:
   base_url: https://yourcompany.atlassian.net
-  api_token: YOUR_API_TOKEN
+  api_token: '@keyring'     # token lives in the OS credential store; a literal token also works
   user_email: you@example.com
   project_key: ENG
-  board_id: '2'
   my_account_id: 61c8a3b2f1e4d500685e1234
   custom_fields:
     story_points: customfield_10016

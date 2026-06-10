@@ -8,6 +8,40 @@ from requests.auth import HTTPBasicAuth
 # value takes effect regardless of how a downstream lib reads it.
 _PROXY_ENV_VARS = ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')
 
+# Every request gets a timeout so a stalled connection can never hang the app
+# (Jira calls run on the GUI thread; without this the window freezes forever).
+_TIMEOUT = 30
+
+# Token-at-rest: when the OS credential store holds the API token, config.yaml
+# carries this sentinel instead of the secret. Any keyring failure (no backend,
+# GPO lockdown) falls back to the plaintext-in-YAML behavior.
+KEYRING_SERVICE = 'jiramaxx'
+KEYRING_SENTINEL = '@keyring'
+
+
+def store_token(user_email: str, token: str) -> bool:
+    """Save the API token in the OS credential store. False on any failure."""
+    try:
+        import keyring
+        keyring.set_password(KEYRING_SERVICE, (user_email or '').strip() or 'default', token)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_token(jira_cfg: dict) -> str:
+    """The usable API token for a ``jira`` config section: the literal value, or
+    the keyring entry when the stored value is the sentinel."""
+    token = ((jira_cfg or {}).get('api_token') or '').strip()
+    if token != KEYRING_SENTINEL:
+        return token
+    try:
+        import keyring
+        user = ((jira_cfg or {}).get('user_email') or '').strip() or 'default'
+        return keyring.get_password(KEYRING_SERVICE, user) or ''
+    except Exception:
+        return ''
+
 
 def _jql_str(value: str) -> str:
     """Escape a value for use inside a double-quoted JQL string literal, so a
@@ -74,7 +108,7 @@ class JiraClient:
         return cls(
             jcfg.get('base_url', ''),
             jcfg.get('user_email', ''),
-            jcfg.get('api_token', ''),
+            resolve_token(jcfg),
             token_type=jcfg.get('token_type', 'classic'),
             cloud_id=jcfg.get('cloud_id', ''),
             **_network_kwargs(config.get('network', {})),
@@ -83,7 +117,8 @@ class JiraClient:
     @staticmethod
     def discover_cloud_id(site_url: str, verify=None, proxies: dict | None = None) -> str:
         r = requests.get(site_url.rstrip('/') + '/_edge/tenant_info',
-                         verify=True if verify is None else verify, proxies=proxies)
+                         verify=True if verify is None else verify, proxies=proxies,
+                         timeout=_TIMEOUT)
         r.raise_for_status()
         return r.json()['cloudId']
 
@@ -99,7 +134,7 @@ class JiraClient:
             )
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        r = self.session.get(f"{self.base}{path}", params=params)
+        r = self.session.get(f"{self.base}{path}", params=params, timeout=_TIMEOUT)
         self._raise(r)
         return r.json()
 
@@ -123,7 +158,7 @@ class JiraClient:
         return issues
 
     def _post(self, path: str, body: dict) -> dict:
-        r = self.session.post(f"{self.base}{path}", json=body)
+        r = self.session.post(f"{self.base}{path}", json=body, timeout=_TIMEOUT)
         self._raise(r)
         # Some endpoints (e.g. POST .../transitions) return 204 No Content on
         # success, so there's no JSON body to parse.
@@ -132,20 +167,47 @@ class JiraClient:
         return r.json()
 
     def _put(self, path: str, body: dict) -> dict:
-        r = self.session.put(f"{self.base}{path}", json=body)
+        r = self.session.put(f"{self.base}{path}", json=body, timeout=_TIMEOUT)
         self._raise(r)
         if not r.content:
             return {}
         return r.json()
 
+    def _delete(self, path: str) -> None:
+        r = self.session.delete(f"{self.base}{path}", timeout=_TIMEOUT)
+        self._raise(r)
+
     def create_issue(self, payload: dict) -> dict:
         try:
             return self._post('/rest/api/3/issue', payload)
         except Exception as exc:
+            # Append the payload for diagnosis but keep the original exception
+            # type, traceback, and attributes (e.g. HTTPError.response) intact.
             import json
-            raise type(exc)(
-                f"{exc}\n\n--- Payload sent ---\n{json.dumps(payload, indent=2)}"
-            ) from None
+            exc.args = (f"{exc}\n\n--- Payload sent ---\n{json.dumps(payload, indent=2)}",)
+            raise
+
+    def get_issue(self, issue_key: str,
+                  fields: str = 'summary,issuetype,status,issuelinks,parent,'
+                                'description,priority,labels') -> dict:
+        """Fetch one issue (with its issue links by default). Used by the planner
+        to hydrate a relationship graph from an existing ticket."""
+        return self._get(f'/rest/api/3/issue/{issue_key}', {'fields': fields})
+
+    def get_children(self, issue_key: str, epic_link_cf: str | None = None,
+                     fields: str = 'summary,issuetype,status,issuelinks,'
+                                   'description,priority,labels',
+                     max_total: int = 200) -> list[dict]:
+        """Direct children of an issue: subtasks / company-managed children via
+        ``parent``, plus legacy epic-link children when ``epic_link_cf`` is given
+        (JQL addresses custom fields as ``cf[<id>]``)."""
+        k = _jql_str(issue_key)
+        jql = f'parent = "{k}"'
+        m = re.match(r'^customfield_(\d+)$', epic_link_cf or '')
+        if m:
+            jql += f' OR cf[{m.group(1)}] = "{k}"'
+        return self._search_all(jql + ' ORDER BY created ASC', fields,
+                                max_total=max_total)
 
     def update_issue(self, issue_key: str, fields: dict) -> dict:
         """Update fields on an existing issue (PUT). Used by the planner to set an
@@ -187,6 +249,11 @@ class JiraClient:
             'inwardIssue': {'key': inward_key},
             'outwardIssue': {'key': outward_key},
         })
+
+    def delete_issue_link(self, link_id: str) -> None:
+        """Delete an issue link by its id (from the issue's ``issuelinks`` field).
+        Used by the planner to remove pushed relationships on Push."""
+        self._delete(f'/rest/api/3/issueLink/{link_id}')
 
     def get_transitions(self, issue_key: str) -> list[dict]:
         return self._get(f'/rest/api/3/issue/{issue_key}/transitions').get('transitions', [])
