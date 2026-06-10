@@ -66,6 +66,17 @@ def test_load_plan_tolerates_garbage(tmp_path):
     assert c.list_plans() == []
 
 
+def test_link_types_snapshot_round_trip(tmp_path):
+    c = make_cache(tmp_path)
+    assert c.load_link_types() is None
+    types = [{'name': 'Blocks', 'inward': 'is blocked by', 'outward': 'blocks'}]
+    c.save_link_types(types)
+    assert c.load_link_types() == types
+    # Corrupt file degrades to "not cached", never raises.
+    c._link_types_path().write_text('{:::', encoding='utf-8')
+    assert c.load_link_types() is None
+
+
 def test_sprint_snapshot_round_trip(tmp_path):
     c = make_cache(tmp_path)
     assert c.load_sprint_issues() is None

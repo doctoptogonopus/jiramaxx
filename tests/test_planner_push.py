@@ -2,11 +2,12 @@ from jiramaxx.cache import new_plan
 from jiramaxx.models import Epic, Story, Task
 from jiramaxx.planner import (_adf_to_text, _apply_relationship,
                               _build_link_options, _changed_jira_fields,
-                              _edge_at_point, _edge_segment, _new_node,
-                              _node_field_diff, _node_size, _plan_from_jira,
-                              _push_change_summary, _push_plan_to_jira,
-                              _queue_unlink, _set_parent_edge,
-                              _touches_existing, _worth_saving)
+                              _edge_at_point, _edge_segment, _incomplete_nodes,
+                              _new_node, _node_field_diff, _node_size,
+                              _plan_from_jira, _push_change_summary,
+                              _push_plan_to_jira, _queue_unlink,
+                              _set_parent_edge, _touches_existing, _view_node,
+                              _worth_saving)
 
 CONFIG = {'jira': {'project_key': 'T',
                    'custom_fields': {'epic_link': 'customfield_10014'}}}
@@ -176,20 +177,34 @@ def test_existing_child_updated_once():
 # ── Hydration (Open from Jira) ────────────────────────────────────────────────
 
 class FakeJiraHydrate:
-    def __init__(self, root, children):
-        self.root, self.children = root, children
+    """Serves a hierarchy via per-parent children maps + a pool of linked
+    issues fetchable by key (mirrors get_issue/get_children/get_issues_by_keys)."""
 
-    def get_issue(self, key):
-        return self.root
+    def __init__(self, issues_by_key: dict, children_of: dict | None = None):
+        self.issues = issues_by_key
+        self.children_of = children_of or {}
+        self.children_calls: list = []
 
-    def get_children(self, key, epic_link_cf=None):
-        return self.children
+    def get_issue(self, key, fields=''):
+        return self.issues[key]
+
+    def get_children(self, keys, epic_link_cf=None, fields='', max_total=200):
+        keys = [keys] if isinstance(keys, str) else list(keys)
+        self.children_calls.append(keys)
+        return [self.issues[c] for k in keys for c in self.children_of.get(k, [])]
+
+    def get_issues_by_keys(self, keys, fields='', max_total=100):
+        return [self.issues[k] for k in keys if k in self.issues]
 
 
-def _issue(key, itype, summary, issuelinks=None):
-    return {'key': key, 'fields': {'summary': summary,
-                                   'issuetype': {'name': itype},
-                                   'issuelinks': issuelinks or []}}
+def _issue(key, itype, summary, issuelinks=None, parent=None, epic=None):
+    f = {'summary': summary, 'issuetype': {'name': itype},
+         'issuelinks': issuelinks or []}
+    if parent:
+        f['parent'] = {'key': parent}
+    if epic:
+        f['customfield_10014'] = epic
+    return {'key': key, 'fields': f}
 
 
 def test_hydration_builds_existing_nodes_and_edges():
@@ -197,29 +212,65 @@ def test_hydration_builds_existing_nodes_and_edges():
     root = _issue('E-1', 'Epic', 'Root epic',
                   issuelinks=[{'id': '77', 'type': blocks,
                                'outwardIssue': {'key': 'C-1'}}])
-    child = _issue('C-1', 'Story', 'Child story',
+    child = _issue('C-1', 'Story', 'Child story', epic='E-1',
                    issuelinks=[{'id': '77', 'type': blocks,
-                                'inwardIssue': {'key': 'E-1'}},
-                               {'id': '88', 'type': blocks,
-                                'outwardIssue': {'key': 'X-9'}}])  # outside graph
-    plan = _plan_from_jira(FakeJiraHydrate(root, [child]), CONFIG, 'E-1')
+                                'inwardIssue': {'key': 'E-1'}}])
+    jira = FakeJiraHydrate({'E-1': root, 'C-1': child}, {'E-1': ['C-1']})
+    plan = _plan_from_jira(jira, CONFIG, 'E-1')
 
     assert plan['name'].startswith('E-1')
     assert all(n['kind'] == 'existing' for n in plan['nodes'])
-    keys = {n['jira_key'] for n in plan['nodes']}
-    assert keys == {'E-1', 'C-1'}
+    assert {n['jira_key'] for n in plan['nodes']} == {'E-1', 'C-1'}
 
     hier = [e for e in plan['edges'] if e.get('category') == 'hierarchy']
     links = [e for e in plan['edges'] if e.get('category') == 'link']
     assert len(hier) == 1 and hier[0]['rel'] == 'epic-child' and hier[0]['pushed']
-    # Link 77 appears on both endpoints but maps to exactly one E-1 → C-1 edge;
-    # link 88 points outside the graph and is dropped.
+    # Link 77 appears on both endpoints but maps to exactly one E-1 → C-1 edge.
     assert len(links) == 1 and links[0]['rel'] == 'Blocks' and links[0]['pushed']
     by_id = {n['node_id']: n['jira_key'] for n in plan['nodes']}
     assert by_id[links[0]['from']] == 'E-1' and by_id[links[0]['to']] == 'C-1'
 
     # A purely hydrated graph holds no local work → never persisted.
     assert not _worth_saving(plan)
+
+
+def test_hydration_recurses_and_pulls_linked_tickets():
+    blocks = {'name': 'Blocks', 'inward': 'is blocked by', 'outward': 'blocks'}
+    root = _issue('E-1', 'Epic', 'Root epic',
+                  issuelinks=[{'id': '70', 'type': blocks,
+                               'outwardIssue': {'key': 'X-9'}}])
+    story = _issue('S-1', 'Story', 'Story', epic='E-1')
+    sub = _issue('S-2', 'Task', 'Grandchild', parent='S-1')
+    # X-9 is outside the tree, linked off the root; its own links must NOT be
+    # expanded into further fetches (one hop only).
+    outside = _issue('X-9', 'Bug', 'Outside blocker',
+                     issuelinks=[{'id': '70', 'type': blocks,
+                                  'inwardIssue': {'key': 'E-1'}},
+                                 {'id': '71', 'type': blocks,
+                                  'outwardIssue': {'key': 'Z-1'}}])
+    jira = FakeJiraHydrate({'E-1': root, 'S-1': story, 'S-2': sub, 'X-9': outside},
+                           {'E-1': ['S-1'], 'S-1': ['S-2']})
+    plan = _plan_from_jira(jira, CONFIG, 'E-1')
+
+    keys = {n['jira_key'] for n in plan['nodes']}
+    assert keys == {'E-1', 'S-1', 'S-2', 'X-9'}        # grandchild + linked, no Z-1
+    by_id = {n['node_id']: n['jira_key'] for n in plan['nodes']}
+    hier = {(by_id[e['from']], by_id[e['to']], e['rel'])
+            for e in plan['edges'] if e.get('category') == 'hierarchy'}
+    assert hier == {('E-1', 'S-1', 'epic-child'), ('S-1', 'S-2', 'subtask')}
+    links = [e for e in plan['edges'] if e.get('category') == 'link']
+    assert len(links) == 1 and links[0]['link_id'] == '70'  # Z-1 edge dropped
+    # One get_children call per level (E-1, then S-1, then S-2's empty level).
+    assert jira.children_calls[0] == ['E-1'] and jira.children_calls[1] == ['S-1']
+
+
+def test_hydration_respects_max_nodes_guard():
+    issues = {'E-1': _issue('E-1', 'Epic', 'root')}
+    issues.update({f'C-{i}': _issue(f'C-{i}', 'Task', f'c{i}', parent='E-1')
+                   for i in range(10)})
+    jira = FakeJiraHydrate(issues, {'E-1': [f'C-{i}' for i in range(10)]})
+    plan = _plan_from_jira(jira, CONFIG, 'E-1', max_nodes=4)
+    assert len(plan['nodes']) == 4  # root + 3 children, capped
 
 
 def test_worth_saving_with_local_work():
@@ -456,7 +507,64 @@ def test_hydrated_link_edges_carry_link_id():
     root = _issue('E-1', 'Epic', 'Root',
                   issuelinks=[{'id': '55', 'type': blocks,
                                'outwardIssue': {'key': 'C-1'}}])
-    child = _issue('C-1', 'Story', 'Child')
-    plan = _plan_from_jira(FakeJiraHydrate(root, [child]), CONFIG, 'E-1')
+    child = _issue('C-1', 'Story', 'Child', epic='E-1')
+    jira = FakeJiraHydrate({'E-1': root, 'C-1': child}, {'E-1': ['C-1']})
+    plan = _plan_from_jira(jira, CONFIG, 'E-1')
     links = [e for e in plan['edges'] if e.get('category') == 'link']
     assert links[0]['link_id'] == '55'
+
+
+# ── Audit-refactor fixes ──────────────────────────────────────────────────────
+
+def test_set_parent_edge_returns_dropped():
+    p1, p2, c = task_node('p1'), task_node('p2'), task_node('c')
+    edges: list = []
+    assert _set_parent_edge(edges, p1, c) == []
+    dropped = _set_parent_edge(edges, p2, c)
+    assert len(dropped) == 1 and dropped[0]['from'] == p1['node_id']
+    assert len([e for e in edges if e.get('category') == 'hierarchy']) == 1
+
+
+def test_renest_unlink_queueing_rules():
+    epic1, epic2 = epic_node(summary='E one'), epic_node(summary='E two')
+    for n, k in ((epic1, 'E-1'), (epic2, 'E-2')):
+        n['kind'], n['jira_key'] = 'existing', k
+    tsk = existing('a task', 'T-1')
+    child = existing('the child', 'C-1')
+    edges: list = []
+    _set_parent_edge(edges, epic1, child)
+    edges[-1]['pushed'] = True
+    plan = plan_with([epic1, epic2, tsk, child], edges)
+    by_id = {n['node_id']: n for n in plan['nodes']}
+
+    # Same-rel re-parent (epic-child → epic-child): plain overwrite, no unlink.
+    _apply_relationship(edges, epic2, child,
+                        {'category': 'hierarchy', 'dir': 'child'}, plan, by_id)
+    assert not plan.get('pending_unlinks')
+
+    # Cross-type re-nest (epic-child → subtask): old epic-link must be cleared.
+    edges[-1]['pushed'] = True
+    _apply_relationship(edges, tsk, child,
+                        {'category': 'hierarchy', 'dir': 'child'}, plan, by_id)
+    assert len(plan['pending_unlinks']) == 1
+    u = plan['pending_unlinks'][0]
+    assert u['hier'] and u['rel'] == 'epic-child' and u['to_key'] == 'C-1'
+
+
+def test_incomplete_nodes_lists_missing_fields():
+    bad = story_node('no points')
+    bad['ticket']['story_points'] = ''
+    fine = existing('fine', 'E-1')
+    plan = plan_with([bad, fine])
+    msgs = _incomplete_nodes(plan)
+    assert len(msgs) == 1 and 'story_points' in msgs[0]
+    assert _incomplete_nodes(plan_with([fine])) == []
+
+
+def test_view_node_transform():
+    n = task_node('v')
+    n['x'], n['y'], n['w'], n['h'] = 100, 50, 200, 80
+    assert _view_node(n, 1.0) == {**n}  # identity at z=1, no pan
+    v = _view_node(n, 0.5, (10, 20))
+    assert (v['x'], v['y'], v['w'], v['h']) == (60.0, 45.0, 100.0, 40.0)
+    assert (n['x'], n['w']) == (100, 200)  # world coords never mutated

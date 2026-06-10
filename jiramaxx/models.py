@@ -34,6 +34,11 @@ def init_jira_config(jira_config: dict):
     FIELD_META['sprint']['options'] = ['(Backlog)'] + [s['name'] for s in sprints]
 
 
+# Fallback Jira custom-field id for the sprint field — single source of truth
+# (api.get_sprints and the config UI reference it too).
+DEFAULT_SPRINT_CF = 'customfield_10020'
+
+
 # ── Field metadata ────────────────────────────────────────────────────────────
 # Single source of truth for widget type, label, and widget-specific options.
 # Add a new field here to make it available for any ticket type via config GUI.
@@ -180,7 +185,7 @@ class Ticket(ABC):
                 link = link.split('/')[-1]
             payload['fields'][el_field] = link
         if self.sprint and self.sprint != '(Backlog)':
-            sp_cf = cf.get('sprint') or 'customfield_10020'
+            sp_cf = cf.get('sprint') or DEFAULT_SPRINT_CF
             cache = _JIRA_CONFIG.get('sprint_cache') or []
             sprint_id = next((s['id'] for s in cache if s['name'] == self.sprint), None)
             if sprint_id:

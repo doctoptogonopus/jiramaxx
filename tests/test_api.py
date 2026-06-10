@@ -91,14 +91,26 @@ def test_every_request_has_a_timeout():
     assert all('timeout' in kw and kw['timeout'] for *_, kw in s.calls)
 
 
-def test_get_children_jql_uses_cf_syntax():
-    c, s = make_client([FakeResponse({'issues': []}), FakeResponse({'issues': []})])
+def test_get_children_jql_single_and_multi_key():
+    c, s = make_client([FakeResponse({'issues': []}),
+                        FakeResponse({'issues': []}),
+                        FakeResponse({'issues': []})])
     c.get_children('E-1', 'customfield_10014')
+    c.get_children(['E-1', 'E-2'], 'customfield_10014')
     c.get_children('E-1', None)
-    with_cf = s.calls[0][2]['jql']
-    without = s.calls[1][2]['jql']
-    assert 'parent = "E-1"' in with_cf and 'cf[10014] = "E-1"' in with_cf
-    assert 'cf[' not in without
+    single, multi, no_cf = (s.calls[i][2]['jql'] for i in range(3))
+    assert 'parent in ("E-1")' in single and 'cf[10014] in ("E-1")' in single
+    assert ('parent in ("E-1", "E-2")' in multi
+            and 'cf[10014] in ("E-1", "E-2")' in multi)
+    assert 'cf[' not in no_cf
+    assert c.get_children([], 'customfield_10014') == []  # no call for no keys
+
+
+def test_get_issues_by_keys_jql():
+    c, s = make_client([FakeResponse({'issues': []})])
+    c.get_issues_by_keys(['X-1', '', 'X-2'])
+    assert s.calls[0][2]['jql'] == 'key in ("X-1", "X-2")'
+    assert c.get_issues_by_keys([]) == []  # no call for no keys
 
 
 def test_create_issue_error_keeps_type_and_appends_payload():

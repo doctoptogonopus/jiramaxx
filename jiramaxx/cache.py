@@ -87,6 +87,33 @@ class Cache:
             pass
         return None
 
+    # ── Issue-link types snapshot ─────────────────────────────────────────────
+    # Link types essentially never change, so the planner fetches them at most
+    # once per installation and reads this file thereafter. Deleting the file is
+    # the manual refresh path.
+
+    def _link_types_path(self) -> Path:
+        return self.dir.parent / 'link_types.yaml'
+
+    def save_link_types(self, types: list) -> None:
+        self.dir.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._link_types_path(), 'w', encoding='utf-8') as f:
+            yaml.dump({'fetched_at': datetime.now().isoformat(), 'types': types},
+                      f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+    def load_link_types(self) -> list | None:
+        path = self._link_types_path()
+        if not path.exists():
+            return None
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            if data and isinstance(data.get('types'), list):
+                return data['types']
+        except Exception:
+            pass
+        return None
+
     # ── Initiative-planner graphs ─────────────────────────────────────────────
     # One YAML file per plan, holding nodes (embedded draft tickets + canvas
     # positions) and relationship edges. Self-contained, separate from drafts.

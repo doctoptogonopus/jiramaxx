@@ -28,6 +28,15 @@ def _node_size(n: dict) -> tuple[int, int]:
     return int(n.get('w') or _NODE_W), int(n.get('h') or _NODE_H)
 
 
+def _view_node(n: dict, z: float, pan: tuple = (0, 0)) -> dict:
+    """A screen-space copy of a node under the view transform
+    ``screen = world·z + pan``. Model/world coords are never mutated, so plans
+    on disk are unaffected by zooming."""
+    w, h = _node_size(n)
+    return {**n, 'x': n['x'] * z + pan[0], 'y': n['y'] * z + pan[1],
+            'w': max(1, w * z), 'h': max(1, h * z)}
+
+
 def _new_node(ticket: Ticket, x: int, y: int) -> dict:
     """A fresh draft node wrapping a ticket at a canvas position."""
     return {'node_id': 'n' + uuid.uuid4().hex[:6], 'x': int(x), 'y': int(y),
@@ -51,14 +60,19 @@ def _hierarchy_rel(parent_node: dict) -> dict:
     return {'category': 'hierarchy', 'rel': 'epic-child' if ptype == 'Epic' else 'subtask'}
 
 
-def _set_parent_edge(edges: list, parent_node: dict, child_node: dict) -> None:
+def _set_parent_edge(edges: list, parent_node: dict, child_node: dict) -> list:
     """Make ``child_node`` a hierarchy-child of ``parent_node``. A node has exactly
     one hierarchy parent, so any existing hierarchy edge into the child is dropped
-    first, then the inferred edge (parent → child) is added."""
+    first, then the inferred edge (parent → child) is added. Returns the dropped
+    edges so callers can queue Jira-side cleanup for pushed ones (see
+    :func:`_apply_relationship`)."""
     cid = child_node['node_id']
+    dropped = [e for e in edges
+               if e.get('category') == 'hierarchy' and e.get('to') == cid]
     edges[:] = [e for e in edges
                 if not (e.get('category') == 'hierarchy' and e.get('to') == cid)]
     edges.append({'from': parent_node['node_id'], 'to': cid, **_hierarchy_rel(parent_node)})
+    return dropped
 
 
 def _edge_segment(a: dict, b: dict) -> tuple | None:
@@ -129,12 +143,13 @@ def _draw_directed_edge(graph, a: dict, b: dict, label: str,
 
 
 def _draw_node(graph, n: dict, line_color: str = 'black', line_width: int = 1,
-               head_prefix: str = '') -> tuple:
+               head_prefix: str = '', zoom: float = 1.0) -> tuple:
     """Draw one node rectangle + caption + corner grips; returns
     (rect_fig, text_fig). The caller decides the border styling (selection /
-    incomplete / modified / diff colors). The top-right ≡ grip is the *move*
-    handle, the bottom-right ◢ hatch the *resize* handle (the body itself only
-    selects, so clicks never accidentally drag)."""
+    incomplete / modified / diff colors) and passes view-space nodes (see
+    ``_view_node``) with the zoom for font scaling. The top-right ≡ grip is the
+    *move* handle, the bottom-right ◢ hatch the *resize* handle (the body
+    itself only selects, so clicks never accidentally drag)."""
     x, y = n['x'], n['y']
     w, h = _node_size(n)
     t = _node_ticket(n)
@@ -145,7 +160,8 @@ def _draw_node(graph, n: dict, line_color: str = 'black', line_width: int = 1,
     chars = max(8, int(w / 7.5))
     txt = graph.draw_text(f"{head}\n{(t.summary or '(no title)')[:chars]}",
                           (x + w / 2, y + h / 2),
-                          color='white', font=('Helvetica', 8))
+                          color='white',
+                          font=('Helvetica', max(6, round(8 * zoom))))
     # Move grip (≡) in the top-right corner.
     for i in range(3):
         gy = y + 4 + i * 3
@@ -204,47 +220,67 @@ def _build_link_options(link_types: list[dict]) -> list[tuple[str, dict]]:
     return opts
 
 
-def _link_options(jira: JiraClient, state: dict) -> list[tuple[str, dict]]:
-    """Link options with the type list fetched once per canvas (memoized in state)."""
+def _link_options(jira: JiraClient, cache: Cache, state: dict) -> list[tuple[str, dict]]:
+    """Link options, resolved canvas state → disk snapshot → network (saved to
+    both). Link types essentially never change, so the network is hit at most
+    once per installation; delete ``link_types.yaml`` to force a refresh."""
     if state.get('link_types') is None:
-        status, types, _ = run_with_busy(jira.get_issue_link_types,
-                                         message='Fetching link types…')
-        state['link_types'] = types if status == 'ok' else []
+        cached = cache.load_link_types()
+        if cached is not None:
+            state['link_types'] = cached
+        else:
+            status, types, _ = run_with_busy(jira.get_issue_link_types,
+                                             message='Fetching link types…')
+            state['link_types'] = types if status == 'ok' else []
+            if status == 'ok' and types:
+                cache.save_link_types(types)
     return _build_link_options(state['link_types'])
 
 
-def _relationship_options(jira: JiraClient, state: dict) -> list[tuple[str, dict]]:
+def _relationship_options(jira: JiraClient, cache: Cache,
+                          state: dict) -> list[tuple[str, dict]]:
     """Everything a new (or re-typed) edge can be: hierarchy first — Child is the
     default — then every dependency-link phrase."""
     return ([('Child  (nests under this ticket)',
               {'category': 'hierarchy', 'dir': 'child'}),
              ('Parent  (this ticket nests under it)',
               {'category': 'hierarchy', 'dir': 'parent'})]
-            + _link_options(jira, state))
+            + _link_options(jira, cache, state))
 
 
-def _apply_relationship(edges: list, source: dict, other: dict, payload: dict) -> None:
+def _apply_relationship(edges: list, source: dict, other: dict, payload: dict,
+                        plan: dict | None = None, by_id: dict | None = None) -> None:
     """Wire ``other`` to ``source`` per a relationship payload from
     :func:`_relationship_options`. Hierarchy goes through ``_set_parent_edge`` (one
-    parent per child); links append a directed source → other edge."""
+    parent per child); links append a directed source → other edge.
+
+    When ``plan``/``by_id`` are given, a *pushed* hierarchy edge displaced by the
+    re-nest is queued for removal in Jira — but only when its rel type differs
+    from the replacement (epic-child ⇄ subtask). A same-rel re-parent is a plain
+    field overwrite on push; clearing it would race the new value."""
     if payload.get('category') == 'hierarchy':
         if payload.get('dir') == 'parent':
-            _set_parent_edge(edges, other, source)
+            dropped = _set_parent_edge(edges, other, source)
         else:
-            _set_parent_edge(edges, source, other)
+            dropped = _set_parent_edge(edges, source, other)
+        new_rel = edges[-1].get('rel')
+        if plan is not None and by_id is not None:
+            for e in dropped:
+                if e.get('pushed') and e.get('rel') != new_rel:
+                    _queue_unlink(plan, e, by_id)
     else:
         edges.append({'from': source['node_id'], 'to': other['node_id'],
                       'category': 'link', 'rel': payload.get('rel'),
                       'reverse': bool(payload.get('reverse'))})
 
 
-def _spawn_dialog(jira: JiraClient, state: dict,
+def _spawn_dialog(jira: JiraClient, cache: Cache, state: dict,
                   with_relationship: bool) -> tuple[str, str, dict | None] | None:
     """Title-first dialog for adding a node. With ``with_relationship`` (arrow
     click) it adds a Relationship dropdown (Child default). Returns
     ``(action, title, rel_payload)`` where action is 'create' or 'import', or
     None if cancelled. Import lets the title double as the search query."""
-    rel_opts = _relationship_options(jira, state) if with_relationship else []
+    rel_opts = _relationship_options(jira, cache, state) if with_relationship else []
     labels = [o[0] for o in rel_opts]
     rows = [[sg.Text('New connected ticket' if with_relationship else 'New ticket',
                      font=('Helvetica', 13, 'bold'))],
@@ -447,6 +483,22 @@ def _apply_unlink(jira: JiraClient, config: dict, unlink: dict) -> None:
     jira.delete_issue_link(link_id)
 
 
+def _incomplete_nodes(plan: dict) -> list[str]:
+    """Per-node 'missing required fields' messages for not-yet-pushed drafts.
+    Used both by the push itself and by the -PUSH- handler, so the user is
+    blocked *before* reviewing a diff that could never apply."""
+    out = []
+    for n in plan.get('nodes', []):
+        if n.get('kind') == 'existing' or n.get('jira_key'):
+            continue
+        t = _node_ticket(n)
+        ok, missing = t.is_valid()
+        if not ok:
+            out.append(f"{t.ticket_type} \"{(t.summary or '(no title)')[:30]}\": "
+                       f"{', '.join(missing)}")
+    return out
+
+
 def _push_plan_to_jira(jira: JiraClient, config: dict, plan: dict) -> tuple[str, bool]:
     """Create every not-yet-pushed draft node as a real issue (parents before
     children), then apply the not-yet-pushed hierarchy updates and issue links.
@@ -459,16 +511,7 @@ def _push_plan_to_jira(jira: JiraClient, config: dict, plan: dict) -> tuple[str,
 
     # Block the whole push if any draft node is missing required fields — surface
     # exactly what's missing rather than creating a partial tree that fails midway.
-    incomplete = []
-    for n in plan['nodes']:
-        if n.get('kind') == 'existing' or n.get('jira_key'):
-            continue
-        t = _node_ticket(n)
-        ok, missing = t.is_valid()
-        if not ok:
-            head = n.get('jira_key') or t.ticket_type
-            incomplete.append(f"{head} \"{(t.summary or '(no title)')[:30]}\": "
-                              f"{', '.join(missing)}")
+    incomplete = _incomplete_nodes(plan)
     if incomplete:
         return ("Push blocked — fix required fields first:\n  "
                 + "\n  ".join(incomplete)), False
@@ -613,56 +656,110 @@ def _worth_saving(plan: dict) -> bool:
             or bool(plan.get('pending_unlinks')))
 
 
-def _plan_from_jira(jira: JiraClient, config: dict, root_key: str) -> dict:
-    """Hydrate an in-memory plan from Jira: the issue, its children, and the
-    dependency links among them, all as read-only existing nodes with edges
-    already marked ``pushed``. Never saved to disk by itself — only local work
-    added on top makes it worth persisting (see :func:`_worth_saving`)."""
+def _link_neighbors(issue: dict) -> list[tuple]:
+    """Each issuelinks entry as ``(other_key, rel, src_key, dst_key, link_id)``.
+    Direction mirrors create_issue_link's verified mapping: reverse=False ⇒ the
+    edge runs inwardIssue → outwardIssue, and an issue's own entry names only
+    the *other* endpoint."""
+    ikey = issue.get('key')
+    out = []
+    for ln in ((issue.get('fields') or {}).get('issuelinks') or []):
+        rel = (ln.get('type') or {}).get('name') or 'Relates'
+        out_key = (ln.get('outwardIssue') or {}).get('key')
+        in_key = (ln.get('inwardIssue') or {}).get('key')
+        if out_key:                      # this issue → outward issue
+            out.append((out_key, rel, ikey, out_key, ln.get('id')))
+        elif in_key:                     # inward issue → this issue
+            out.append((in_key, rel, in_key, ikey, ln.get('id')))
+    return out
+
+
+def _plan_from_jira(jira: JiraClient, config: dict, root_key: str,
+                    max_depth: int = 6, max_nodes: int = 120) -> dict:
+    """Hydrate an in-memory plan from Jira: the issue, its descendants
+    (recursively — one JQL call per depth level, not per node), the tickets
+    linked to any of them (one batch call, a single hop), and every
+    relationship among them — all as existing nodes with edges already marked
+    ``pushed``. Never saved to disk by itself (see :func:`_worth_saving`).
+
+    Guards: ``max_depth`` levels / ``max_nodes`` issues cap a runaway tree.
+    Linked tickets' own links are NOT expanded further — one hop, otherwise
+    this would crawl the project."""
     epic_cf = _epic_link_cf(config)
-    root = jira.get_issue(root_key)
+    fields = ('summary,issuetype,status,issuelinks,description,priority,labels,'
+              f'parent,{epic_cf}')
+    root = jira.get_issue(root_key, fields=fields)
     rkey = root.get('key', root_key)
-    children = jira.get_children(rkey, epic_cf)
+
+    # BFS over the hierarchy, one get_children call per level.
+    tree: dict[str, dict] = {rkey: root}
+    depth_of: dict[str, int] = {rkey: 0}
+    level = [rkey]
+    depth = 0
+    while level and depth < max_depth and len(tree) < max_nodes:
+        next_level = []
+        for ch in jira.get_children(level, epic_cf, fields=fields):
+            k = ch.get('key')
+            if not k or k in tree:
+                continue
+            tree[k] = ch
+            depth_of[k] = depth + 1
+            next_level.append(k)
+            if len(tree) >= max_nodes:
+                break
+        level = next_level
+        depth += 1
+
+    # Linked tickets: one hop off any tree member, fetched in one batch.
+    linked_keys = sorted({other for issue in tree.values()
+                          for other, *_ in _link_neighbors(issue)} - set(tree))[:40]
+    linked = {i['key']: i for i in
+              (jira.get_issues_by_keys(linked_keys, fields=fields)
+               if linked_keys else [])}
 
     plan = new_plan(rkey, epic_key=rkey)
     summ = ((root.get('fields') or {}).get('summary') or '')[:24]
     plan['name'] = f"{rkey} {summ}".strip()
 
-    issues = [root] + children
+    # Layout: one row per depth (wrapping after 5); linked-only tickets in a
+    # final row below the tree. Everything stays draggable/resizable.
     by_key: dict[str, dict] = {}
-    for idx, issue in enumerate(issues):
-        if idx == 0:
-            x, y = 60, 40  # root anchors the top; children grid below it
-        else:
-            x = 60 + ((idx - 1) % 5) * 172
-            y = 170 + ((idx - 1) // 5) * 96
-        node = _existing_node(issue, x, y)
+    row_counts: dict[int, int] = {}
+    for k, issue in tree.items():
+        d = depth_of[k]
+        i = row_counts.get(d, 0)
+        row_counts[d] = i + 1
+        node = _existing_node(issue, 60 + (i % 5) * 172 + (28 if d else 0),
+                              40 + d * 130 + (i // 5) * 60)
         plan['nodes'].append(node)
-        by_key[issue.get('key')] = node
+        by_key[k] = node
+    linked_y = 40 + (max(depth_of.values()) + 1) * 130 + 40
+    for i, k in enumerate(sorted(linked)):
+        node = _existing_node(linked[k], 60 + (i % 5) * 172,
+                              linked_y + (i // 5) * 96)
+        plan['nodes'].append(node)
+        by_key[k] = node
 
-    root_node = by_key[rkey]
-    for child in children:
-        plan['edges'].append({'from': root_node['node_id'],
-                              'to': by_key[child['key']]['node_id'],
-                              **_hierarchy_rel(root_node), 'pushed': True})
+    # Hierarchy edges from each child's own parent / epic-link field (children
+    # of different parents arrive in one level batch, so the field is the only
+    # reliable attachment).
+    for k, issue in tree.items():
+        if k == rkey:
+            continue
+        f = issue.get('fields') or {}
+        pkey = ((f.get('parent') or {}).get('key')) or f.get(epic_cf)
+        pnode = by_key.get(str(pkey)) if pkey else None
+        if pnode is None:
+            continue
+        plan['edges'].append({'from': pnode['node_id'], 'to': by_key[k]['node_id'],
+                              **_hierarchy_rel(pnode), 'pushed': True})
 
-    # Dependency links among the fetched issues. Each link shows up on both of
-    # its endpoints, so dedupe by link id. Direction mirrors create_issue_link's
-    # verified mapping: reverse=False ⇒ the edge runs inwardIssue → outwardIssue,
-    # and an issue's own entry names only the *other* endpoint.
+    # Dependency links among everything fetched; each link appears on both of
+    # its endpoints, so dedupe by link id.
     seen: set = set()
-    for issue in issues:
-        ikey = issue.get('key')
-        for ln in ((issue.get('fields') or {}).get('issuelinks') or []):
-            rel = (ln.get('type') or {}).get('name') or 'Relates'
-            out_key = (ln.get('outwardIssue') or {}).get('key')
-            in_key = (ln.get('inwardIssue') or {}).get('key')
-            if out_key:                      # this issue → outward issue
-                src, dst = ikey, out_key
-            elif in_key:                     # inward issue → this issue
-                src, dst = in_key, ikey
-            else:
-                continue
-            lid = ln.get('id') or (rel, src, dst)
+    for issue in list(tree.values()) + list(linked.values()):
+        for other, rel, src, dst, raw_id in _link_neighbors(issue):
+            lid = raw_id or (rel, src, dst)
             if lid in seen or src not in by_key or dst not in by_key:
                 continue
             seen.add(lid)
@@ -670,7 +767,7 @@ def _plan_from_jira(jira: JiraClient, config: dict, root_key: str) -> dict:
                                   'to': by_key[dst]['node_id'],
                                   'category': 'link', 'rel': rel,
                                   'reverse': False, 'pushed': True,
-                                  'link_id': ln.get('id')})
+                                  'link_id': raw_id})
     return plan
 
 
@@ -766,29 +863,40 @@ def _confirm_push_with_preview(plan: dict, by_id: dict) -> bool:
     w.bind('<Escape>', '-NO-')
     bring_to_front(w)
 
+    # Fit-to-canvas zoom so big hydrated graphs are fully visible in the review.
+    all_nodes = plan.get('nodes', [])
+    extent_x = max((n['x'] + _node_size(n)[0] for n in all_nodes), default=_CANVAS_W)
+    extent_y = max((n['y'] + _node_size(n)[1] for n in all_nodes), default=_CANVAS_H)
+    z = min(1.0, (_CANVAS_W - 24) / max(extent_x, 1), (_CANVAS_H - 24) / max(extent_y, 1))
+    view = {n['node_id']: _view_node(n, z) for n in all_nodes}
+
     for e in plan.get('edges', []):
-        a, b = by_id.get(e['from']), by_id.get(e['to'])
+        a, b = view.get(e['from']), view.get(e['to'])
         if not a or not b:
             continue
         new = not e.get('pushed')
         _draw_directed_edge(graph, a, b, _edge_label(e),
                             color='#2e7d32' if new else '#9e9e9e',
                             label_color='#2e7d32' if new else '#1565c0')
-    key_to_node = {n.get('jira_key'): n for n in plan.get('nodes', []) if n.get('jira_key')}
+    key_to_view = {n.get('jira_key'): view[n['node_id']]
+                   for n in all_nodes if n.get('jira_key')}
     for u in plan.get('pending_unlinks') or []:
-        a, b = key_to_node.get(u.get('from_key')), key_to_node.get(u.get('to_key'))
+        a, b = key_to_view.get(u.get('from_key')), key_to_view.get(u.get('to_key'))
         rel = ('child' if u.get('hier') else u.get('rel')) or 'link'
         if a and b:
             _draw_directed_edge(graph, a, b, f'✕ {rel}',
                                 color='#e53935', label_color='#e53935')
-    for n in plan.get('nodes', []):
+    for n in all_nodes:
+        vn = view[n['node_id']]
         new = n.get('kind') != 'existing' and not n.get('jira_key')
         if new:
-            _draw_node(graph, n, line_color='#2e7d32', line_width=3, head_prefix='+ ')
+            _draw_node(graph, vn, line_color='#2e7d32', line_width=3,
+                       head_prefix='+ ', zoom=z)
         elif n.get('orig_ticket'):
-            _draw_node(graph, n, line_color='#fb8c00', line_width=3, head_prefix='✎ ')
+            _draw_node(graph, vn, line_color='#fb8c00', line_width=3,
+                       head_prefix='✎ ', zoom=z)
         else:
-            _draw_node(graph, n)
+            _draw_node(graph, vn, zoom=z)
     w['-DIFFS-'].update(_push_change_summary(plan, by_id) or '(no changes)')
 
     ev, _ = _read(w)
@@ -803,7 +911,8 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     by_id = {n['node_id']: n for n in nodes}
     state = {'selected': None, 'selected_edge': None,
              'drag_node': None, 'drag_off': (0, 0), 'moved': False,
-             'resize_node': None, 'body_press': False,
+             'resize_node': None, 'body_press': False, 'pan_press': None,
+             'zoom': 1.0, 'pan': (0, 0),
              'link_types': None, 'arrows': {}, 'hover': None, 'arrow_armed': None}
 
     graph = sg.Graph((_CANVAS_W, _CANVAS_H), (0, _CANVAS_H), (_CANVAS_W, 0),
@@ -815,6 +924,9 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         [sg.Button('Add Ticket', key='-ADD-'),
          sg.Button('Edit', key='-EDIT-', disabled=True),
          sg.Button('Delete', key='-DEL-', disabled=True),
+         sg.Button('−', key='-ZOUT-', size=(2, 1), tooltip='Zoom out (Ctrl+wheel)'),
+         sg.Button('⊙', key='-ZRESET-', size=(2, 1), tooltip='Reset zoom & pan'),
+         sg.Button('+', key='-ZIN-', size=(2, 1), tooltip='Zoom in (Ctrl+wheel)'),
          sg.Push(),
          sg.Button('Push to Jira', key='-PUSH-'),
          sg.Button('Save', key='-PSAVE-'),
@@ -822,7 +934,8 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         [graph],
         [sg.Text('Hover a node and click a side arrow to add a connected ticket · '
                  'drag the ≡ grip (top-right) to move, the ◢ grip (bottom-right) to '
-                 'resize · click a node or a line to select it (Edit / Delete).',
+                 'resize · click a node or a line to select it · drag empty space '
+                 'to pan, Ctrl+wheel to zoom.',
                  font=('Helvetica', 8))],
     ]
     window = sg.Window(f"Plan — {plan.get('name', '')}", layout, finalize=True,
@@ -832,14 +945,34 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     figmap: dict = {}
 
     def _status(msg: str = '') -> None:
+        z = state['zoom']
+        ztxt = f" · {round(z * 100)}%" if abs(z - 1) > 1e-9 else ''
         window['-PSTATUS-'].update(
-            msg or f"{len(nodes)} node(s) · {len(edges)} edge(s)")
+            (msg or f"{len(nodes)} node(s) · {len(edges)} edge(s)") + ztxt)
+
+    # ── View transform (zoom + pan): screen = world·z + pan ─────────────────
+    # Model coords stay world-space; only rendering/hit-testing transform.
+
+    def _to_world(pt) -> tuple:
+        z = state['zoom']
+        px, py = state['pan']
+        return ((pt[0] - px) / z, (pt[1] - py) / z)
+
+    def _set_zoom(z: float, anchor=None) -> None:
+        z = max(0.4, min(2.0, z))
+        if anchor is None:
+            anchor = (_CANVAS_W / 2, _CANVAS_H / 2)
+        wx, wy = _to_world(anchor)  # keep this world point under the anchor
+        state['zoom'] = z
+        state['pan'] = (anchor[0] - wx * z, anchor[1] - wy * z)
+        redraw()
+        _status()
 
     # ── Hover arrows (the spawn affordance) ──────────────────────────────────
     # Drawn straight on the tk canvas from the <Motion> callback; graph coords
     # equal widget pixels for this Graph (origin top-left, y down).
 
-    _GAP, _ARROW_L, _ARROW_HALF, _HALO = 8, 20, 9, 34
+    _GAP, _ARROW_L, _ARROW_HALF = 8, 20, 9
 
     def _clear_arrows() -> None:
         for fid in list(state['arrows']):
@@ -853,8 +986,9 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     def _draw_arrows(n: dict) -> None:
         _clear_arrows()
         state['hover'] = n['node_id']
-        x, y = n['x'], n['y']
-        w, h = _node_size(n)
+        # Arrows render in screen space (constant pixel size at any zoom).
+        vn = _view_node(n, state['zoom'], state['pan'])
+        x, y, w, h = vn['x'], vn['y'], vn['w'], vn['h']
         cx, cy = x + w / 2, y + h / 2
         bases = {'E': ((x + w + _GAP, cy), (1, 0)),
                  'W': ((x - _GAP, cy), (-1, 0)),
@@ -875,31 +1009,36 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             state['arrows'][fid] = (n['node_id'], side)
 
     def _node_at(px, py) -> dict | None:
-        for n in nodes:
+        # reversed: later nodes draw on top, so they win overlapping hit-tests.
+        for n in reversed(nodes):
             w, h = _node_size(n)
             if n['x'] <= px <= n['x'] + w and n['y'] <= py <= n['y'] + h:
                 return n
         return None
 
     def _handle_at(px, py) -> tuple | None:
-        """('move'|'resize', node) when the point is inside a corner grip:
-        top-right ≡ moves the node, bottom-right ◢ resizes it."""
-        for n in nodes:
+        """('move'|'resize', node) when the (world) point is inside a corner
+        grip: top-right ≡ moves the node, bottom-right ◢ resizes it. The grip
+        zone is constant in *screen* pixels, so it scales inversely in world."""
+        zone = _HANDLE / max(state['zoom'], 0.1)
+        for n in reversed(nodes):
             w, h = _node_size(n)
             x, y = n['x'], n['y']
-            if x + w - _HANDLE <= px <= x + w:
-                if y <= py <= y + _HANDLE:
+            if x + w - zone <= px <= x + w:
+                if y <= py <= y + zone:
                     return 'move', n
-                if y + h - _HANDLE <= py <= y + h:
+                if y + h - zone <= py <= y + h:
                     return 'resize', n
         return None
 
     def _on_motion(ev) -> None:
-        if state['drag_node'] is not None or state['resize_node'] is not None:
+        if (state['drag_node'] is not None or state['resize_node'] is not None
+                or state['pan_press'] is not None):
             return
-        n = _node_at(ev.x, ev.y)
+        wx, wy = _to_world((ev.x, ev.y))
+        n = _node_at(wx, wy)
         # Cursor hints over the grips.
-        handle = _handle_at(ev.x, ev.y)
+        handle = _handle_at(wx, wy)
         try:
             graph.Widget.config(cursor='fleur' if handle and handle[0] == 'move'
                                 else 'size_nw_se' if handle else '')
@@ -913,17 +1052,25 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             hov = by_id.get(state['hover'])
             if hov:
                 w, h = _node_size(hov)
-                # Keep the arrows alive while crossing the gap toward them.
-                if (hov['x'] - _HALO <= ev.x <= hov['x'] + w + _HALO
-                        and hov['y'] - _HALO <= ev.y <= hov['y'] + h + _HALO):
+                # Keep the arrows alive while crossing the gap toward them
+                # (halo covers the screen-space arrow extent, in world units).
+                halo = (_GAP + _ARROW_L + 6) / max(state['zoom'], 0.1)
+                if (hov['x'] - halo <= wx <= hov['x'] + w + halo
+                        and hov['y'] - halo <= wy <= hov['y'] + h + halo):
                     return
             _clear_arrows()
+
+    def _on_wheel(ev) -> None:
+        # Windows wheel delta is ±120 per notch; anchor at the pointer.
+        _set_zoom(state['zoom'] * (1.2 if ev.delta > 0 else 1 / 1.2),
+                  anchor=(ev.x, ev.y))
 
     # add='+' is load-bearing: PySimpleGUI delivers drag_submits events through
     # its own <Motion> binding on this canvas — a plain bind() would replace it
     # and silently kill node dragging.
     graph.Widget.bind('<Motion>', _on_motion, add='+')
     graph.Widget.bind('<Leave>', lambda e: _clear_arrows(), add='+')
+    graph.Widget.bind('<Control-MouseWheel>', _on_wheel, add='+')
 
     # ── Rendering & selection ────────────────────────────────────────────────
 
@@ -931,8 +1078,10 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         graph.erase()
         state['arrows'].clear()
         state['hover'] = None
+        z, pan = state['zoom'], state['pan']
+        view = {nid: _view_node(n, z, pan) for nid, n in by_id.items()}
         for i, e in enumerate(edges):
-            a, b = by_id.get(e['from']), by_id.get(e['to'])
+            a, b = view.get(e['from']), view.get(e['to'])
             if not a or not b:
                 continue
             sel = i == state['selected_edge']
@@ -957,7 +1106,7 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             else:
                 lc, lw = 'black', 1
             prefix = '⚠ ' if incomplete else ('✎ ' if dirty else '')
-            rect, txt = _draw_node(graph, n, lc, lw, prefix)
+            rect, txt = _draw_node(graph, view[n['node_id']], lc, lw, prefix, zoom=z)
             figmap[n['node_id']] = {'rect': rect, 'text': txt}
 
     def fig_to_node(figs) -> str | None:
@@ -965,7 +1114,9 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         for nid, f in figmap.items():
             rev[f['rect']] = nid
             rev[f['text']] = nid
-        for f in (figs or []):
+        # find_overlapping returns bottom→top; scan from the end so the node
+        # drawn on top wins when nodes overlap.
+        for f in reversed(list(figs or [])):
             if f in rev:
                 return rev[f]
         return None
@@ -1001,7 +1152,7 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     def _spawn_from(source: dict | None, side: str | None) -> None:
         """Add a node via the title-first dialog — from a hover arrow (with a
         relationship to ``source``) or from Add Ticket (independent)."""
-        res = _spawn_dialog(jira, state, with_relationship=source is not None)
+        res = _spawn_dialog(jira, cache, state, with_relationship=source is not None)
         if not res:
             return
         action, title, rel = res
@@ -1025,9 +1176,14 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             issue = _pick_existing_issue(jira, config, initial_query=title)
             if not issue:
                 return
-            node = add_existing(issue, x, y)
+            # Search results carry only summary/type/status — hydrate the full
+            # issue (description, priority, labels, issuelinks ids) so the node
+            # reflects Jira's real state. One GET behind an explicit action.
+            status, full, _ = run_with_busy(lambda: jira.get_issue(issue['key']),
+                                            message=f"Loading {issue['key']}…")
+            node = add_existing(full if status == 'ok' and full else issue, x, y)
         if source is not None and rel:
-            _apply_relationship(edges, source, node, rel)
+            _apply_relationship(edges, source, node, rel, plan, by_id)
         set_selected(nid=node['node_id'])
         _status()
 
@@ -1035,7 +1191,7 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         """Re-type the selected relationship; a pushed one is queued for removal
         in Jira and replaced by the new (unpushed) edge."""
         e = edges[idx]
-        opts = _relationship_options(jira, state)
+        opts = _relationship_options(jira, cache, state)
         labels = [o[0] for o in opts]
         cur = labels[0]
         if e.get('category') == 'link':
@@ -1063,10 +1219,20 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         a, b = by_id.get(e['from']), by_id.get(e['to'])
         if not a or not b:
             return
-        if e.get('pushed'):
-            _queue_unlink(plan, e, by_id)
-        edges.pop(idx)
-        _apply_relationship(edges, a, b, payload)
+        old = edges.pop(idx)
+        if old.get('pushed'):
+            if old.get('category') == 'link':
+                _queue_unlink(plan, old, by_id)
+            else:
+                # Hierarchy: only clear in Jira when this isn't a same-child,
+                # same-rel overwrite (push would set the new value anyway, and
+                # the unlink phase runs after — clearing would undo it).
+                same_overwrite = (payload.get('category') == 'hierarchy'
+                                  and payload.get('dir') != 'parent'
+                                  and _hierarchy_rel(a)['rel'] == old.get('rel'))
+                if not same_overwrite:
+                    _queue_unlink(plan, old, by_id)
+        _apply_relationship(edges, a, b, payload, plan, by_id)
         set_selected()
         _status()
 
@@ -1078,22 +1244,32 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         if event in (sg.WIN_CLOSED, '-PCLOSE-'):
             if _worth_saving(plan):
                 cache.save_plan(plan)
+            else:
+                # A plan with no local work left must not leave a stale file
+                # behind — it would resurrect deleted nodes on reopen.
+                cache.delete_plan(plan['plan_id'])
             break
 
         if event == '-CANVAS-':
             pt = values['-CANVAS-']
             if pt == (None, None) or state['arrow_armed'] is not None:
                 continue
+            wpt = _to_world(pt)
             if state['drag_node'] is not None:
                 n = by_id[state['drag_node']]
-                n['x'] = int(pt[0] - state['drag_off'][0])
-                n['y'] = int(pt[1] - state['drag_off'][1])
+                n['x'] = int(wpt[0] - state['drag_off'][0])
+                n['y'] = int(wpt[1] - state['drag_off'][1])
                 state['moved'] = True
                 redraw()
             elif state['resize_node'] is not None:
                 n = by_id[state['resize_node']]
-                n['w'] = max(_MIN_W, int(pt[0] - n['x']))
-                n['h'] = max(_MIN_H, int(pt[1] - n['y']))
+                n['w'] = max(_MIN_W, int(wpt[0] - n['x']))
+                n['h'] = max(_MIN_H, int(wpt[1] - n['y']))
+                state['moved'] = True
+                redraw()
+            elif state['pan_press'] is not None:
+                p0, pan0 = state['pan_press']
+                state['pan'] = (pan0[0] + pt[0] - p0[0], pan0[1] + pt[1] - p0[1])
                 state['moved'] = True
                 redraw()
             elif not state['body_press']:  # first press of this gesture
@@ -1104,18 +1280,22 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
                     # Press landed on a hover arrow — spawn on release, no drag.
                     state['arrow_armed'] = arrow
                     continue
-                handle = _handle_at(*pt)
+                handle = _handle_at(*wpt)
                 if handle is not None:
                     kind, n = handle
                     if kind == 'move':
                         state.update(drag_node=n['node_id'], moved=False,
-                                     drag_off=(pt[0] - n['x'], pt[1] - n['y']))
+                                     drag_off=(wpt[0] - n['x'], wpt[1] - n['y']))
                     else:
                         state.update(resize_node=n['node_id'], moved=False)
-                else:
+                elif _node_at(*wpt) is not None:
                     # Body press: selection only, resolved on release. Sticky so
                     # dragging across a grip mid-gesture doesn't start a move.
                     state['body_press'] = True
+                else:
+                    # Empty canvas: pan gesture (screen-space deltas).
+                    state['pan_press'] = (pt, state['pan'])
+                    state['moved'] = False
             continue
 
         if event == '-CANVAS-+UP':
@@ -1123,14 +1303,17 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             armed, state['arrow_armed'] = state['arrow_armed'], None
             dragged = ((state['drag_node'] is not None
                         or state['resize_node'] is not None) and state['moved'])
+            panned = state['pan_press'] is not None and state['moved']
             grabbed = state['drag_node'] or state['resize_node']
-            state.update(drag_node=None, resize_node=None,
+            state.update(drag_node=None, resize_node=None, pan_press=None,
                          moved=False, body_press=False)
             if armed is not None:
                 src = by_id.get(armed[0])
                 if src is not None:
                     _spawn_from(src, armed[1])
                 continue
+            if panned:
+                continue  # the view moved; selection unchanged
             if dragged:
                 set_selected(nid=grabbed)
             else:
@@ -1139,8 +1322,22 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
                 if clicked is not None:
                     set_selected(nid=clicked)
                 else:
-                    eidx = _edge_at_point(pt, by_id, edges) if valid else None
+                    # ~6 screen px tolerance regardless of zoom.
+                    eidx = (_edge_at_point(_to_world(pt), by_id, edges,
+                                           threshold=6 / max(state['zoom'], 0.1))
+                            if valid else None)
                     set_selected(edge_idx=eidx)
+            continue
+
+        if event in ('-ZIN-', '-ZOUT-'):
+            _set_zoom(state['zoom'] * (1.2 if event == '-ZIN-' else 1 / 1.2))
+            continue
+
+        if event == '-ZRESET-':
+            state['zoom'] = 1.0
+            state['pan'] = (0, 0)
+            redraw()
+            _status()
             continue
 
         if event == '-ADD-':
@@ -1200,6 +1397,13 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         elif event == '-PUSH-':
             if not nodes and not plan.get('pending_unlinks'):
                 sg.popup('Nothing to push yet.', modal=True, keep_on_top=True)
+                continue
+            # Validation first: don't let the user review/confirm a diff that
+            # could never apply.
+            incomplete = _incomplete_nodes(plan)
+            if incomplete:
+                show_error('Push blocked — fix required fields first:\n  '
+                           + '\n  '.join(incomplete), title='Push to Jira')
                 continue
             # Touching content already in Jira warrants the visual diff review;
             # a pure-new plan keeps the simple confirm.
