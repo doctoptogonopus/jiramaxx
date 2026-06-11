@@ -4,6 +4,8 @@ import re
 import requests
 from requests.auth import HTTPBasicAuth
 
+from .models import DEFAULT_SPRINT_CF
+
 # The standard proxy env vars requests honors. We set every case variant so the
 # value takes effect regardless of how a downstream lib reads it.
 _PROXY_ENV_VARS = ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')
@@ -194,20 +196,37 @@ class JiraClient:
         to hydrate a relationship graph from an existing ticket."""
         return self._get(f'/rest/api/3/issue/{issue_key}', {'fields': fields})
 
-    def get_children(self, issue_key: str, epic_link_cf: str | None = None,
+    def get_children(self, issue_keys, epic_link_cf: str | None = None,
                      fields: str = 'summary,issuetype,status,issuelinks,'
                                    'description,priority,labels',
                      max_total: int = 200) -> list[dict]:
-        """Direct children of an issue: subtasks / company-managed children via
-        ``parent``, plus legacy epic-link children when ``epic_link_cf`` is given
-        (JQL addresses custom fields as ``cf[<id>]``)."""
-        k = _jql_str(issue_key)
-        jql = f'parent = "{k}"'
+        """Direct children of one or more issues, in a single JQL call: subtasks /
+        company-managed children via ``parent``, plus legacy epic-link children
+        when ``epic_link_cf`` is given (JQL addresses custom fields as
+        ``cf[<id>]``). Accepting a list keeps recursive hydration at one HTTP
+        call per tree *level* instead of one per node."""
+        keys = [issue_keys] if isinstance(issue_keys, str) else list(issue_keys)
+        if not keys:
+            return []
+        klist = ', '.join(f'"{_jql_str(k)}"' for k in keys)
+        jql = f'parent in ({klist})'
         m = re.match(r'^customfield_(\d+)$', epic_link_cf or '')
         if m:
-            jql += f' OR cf[{m.group(1)}] = "{k}"'
+            jql += f' OR cf[{m.group(1)}] in ({klist})'
         return self._search_all(jql + ' ORDER BY created ASC', fields,
                                 max_total=max_total)
+
+    def get_issues_by_keys(self, keys: list[str],
+                           fields: str = 'summary,issuetype,status,issuelinks,'
+                                         'description,priority,labels',
+                           max_total: int = 100) -> list[dict]:
+        """Batch-fetch specific issues (``key in (…)``) — used for the linked
+        tickets pulled into a hydrated plan, one call for the whole set."""
+        keys = [k for k in keys if k]
+        if not keys:
+            return []
+        klist = ', '.join(f'"{_jql_str(k)}"' for k in keys)
+        return self._search_all(f'key in ({klist})', fields, max_total=max_total)
 
     def update_issue(self, issue_key: str, fields: dict) -> dict:
         """Update fields on an existing issue (PUT). Used by the planner to set an
@@ -215,17 +234,53 @@ class JiraClient:
         return self._put(f'/rest/api/3/issue/{issue_key}', {'fields': fields})
 
     def search_issues(self, project_key: str, text: str, max_total: int = 50) -> list[dict]:
-        """Live search for existing issues. A key-looking term (e.g. ``PAY-12``)
-        matches by key; anything else does a summary text search within the project.
+        """Live search for existing issues. A key-looking term (e.g. ``PAY-12``
+        or a bare ticket number) resolves via the issue endpoint; free text
+        combines a server-side token/prefix JQL match with a client-side
+        substring scan of the project's recently updated issues. The scan is
+        what makes infix terms work ('EPIC2' finding 'TESTEPIC2'): Jira's
+        Lucene search has no infix support — a leading ``*`` isn't treated as
+        a wildcard, it just matches nothing.
         Returns raw issue dicts (key + summary/issuetype/status fields)."""
         text = (text or '').strip()
-        if re.match(r'^[A-Za-z][A-Za-z0-9]*-\d+$', text):
-            jql = f'key = "{_jql_str(text)}"'
-        else:
-            jql = (f'project = "{_jql_str(project_key)}" '
-                   f'AND summary ~ "{_jql_str(text)}"')
-        return self._search_all(jql + ' ORDER BY updated DESC',
-                                'summary,issuetype,status', max_total=max_total)
+        fields = 'summary,issuetype,status'
+        # Key-shaped queries resolve via the issue endpoint, not JQL: Jira
+        # *validates* `key =` clauses and returns HTTP 400 (not an empty result)
+        # when the key doesn't exist, which would turn every typo into an error.
+        key = None
+        if re.match(r'^\d+$', text):
+            # Pure numeric → a ticket number in the configured project
+            key = f'{project_key}-{text}'
+        elif re.match(r'^[A-Za-z][A-Za-z0-9]*-\d+$', text):
+            key = text.upper()
+        if key:
+            try:
+                return [self.get_issue(key, fields=fields)]
+            except requests.exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) == 404:
+                    return []   # no such ticket — an empty result, not an error
+                raise
+        # Server side: token match; a trailing * widens a single word to a
+        # token *prefix* (valid JQL — wildcards can't be mixed into multi-word
+        # phrases, so those search as plain phrases).
+        term = _jql_str(text) + ('*' if text and ' ' not in text else '')
+        proj = _jql_str(project_key)
+        found = self._search_all(
+            f'project = "{proj}" AND summary ~ "{term}" ORDER BY updated DESC',
+            fields, max_total=max_total)
+        # Client side: substring-scan the most recent issues so mid-word terms
+        # match too. Bounded window — very old tickets are only reachable by
+        # token/prefix terms or their key.
+        if len(found) < max_total:
+            seen = {i.get('key') for i in found}
+            needle = text.lower()
+            recent = self._search_all(
+                f'project = "{proj}" ORDER BY updated DESC',
+                fields, max_total=200)
+            found += [i for i in recent
+                      if i.get('key') not in seen and needle in
+                      ((i.get('fields') or {}).get('summary') or '').lower()]
+        return found[:max_total]
 
     def add_comment(self, issue_key: str, text: str) -> dict:
         return self._post(f'/rest/api/3/issue/{issue_key}/comment', {
@@ -284,7 +339,7 @@ class JiraClient:
             fields.append(epic_link_cf)
         return self._search_all(jql, ','.join(fields))
 
-    def get_sprints(self, project_key: str, sprint_cf: str = 'customfield_10020') -> list[dict]:
+    def get_sprints(self, project_key: str, sprint_cf: str = DEFAULT_SPRINT_CF) -> list[dict]:
         """Extract sprint metadata from issue fields — no Agile API scope required."""
         jql = (f'project="{_jql_str(project_key)}" '
                'AND sprint not in closedSprints() ORDER BY updated DESC')

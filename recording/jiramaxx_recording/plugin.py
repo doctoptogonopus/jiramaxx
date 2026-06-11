@@ -30,13 +30,14 @@ def _ensure_model(model_path: str, model_name: str) -> bool:
     Returns True only when the model is ready; False if declined or failed.
     Only ever called from an explicit user action — never auto-downloads."""
     from .engine import prepare_model, _MODEL_APPROX_MB, DEFAULT_MODEL
+    from jiramaxx.ui import _yn_dialog
     name = model_name or DEFAULT_MODEL
     mb = _MODEL_APPROX_MB.get(name, '?')
-    if sg.popup_yes_no(
+    if not _yn_dialog(
             f"The transcription model '{name}' (~{mb} MB) needs to download "
             f"from Hugging Face first.\n\nDownload now? Recording won't start "
             f"until it finishes.",
-            title='Download model', modal=True, keep_on_top=True) != 'Yes':
+            title='Download model'):
         return False
 
     result: dict = {}

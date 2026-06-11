@@ -272,9 +272,12 @@ sketching out an epic and the stories/tasks/subtasks under it as a connected gra
 anything goes to Jira. Everything stays as **local drafts** until you push.
 
 You first see a list of saved plans; **New plan** names a fresh canvas, **Open** reopens one, and
-**Open from Jira** loads an *existing* ticket straight from Jira — the issue, its children, and
-the dependency links between them appear as a ready-made graph you can extend **and edit** (see
-*Editing pushed content* below). The name you give a new plan also **seeds an Epic node** on the
+**Open from Jira** loads an *existing* ticket straight from Jira — the issue, **all of its
+descendants (children, grandchildren, …)**, the **tickets linked to any of them** by dependency
+links, and every relationship between them appear as a ready-made graph you can extend **and
+edit** (see *Editing pushed content* below). The tree renders one row per depth with linked
+tickets below it, and the fetch stays fast: one JQL call per tree *level* plus one batch for the
+linked tickets (capped at 6 levels / 120 tickets). The name you give a new plan also **seeds an Epic node** on the
 canvas (titled with that name) so the initiative starts with an anchor instead of a blank canvas
 — it's an ordinary draft you can edit, fill in, or delete.
 
@@ -306,7 +309,8 @@ The toolbar is intentionally small:
 | **Click a node or a line** | Select it — the node body only selects (it never drags); relationship arrows are selectable too (enables Edit / Delete) |
 | **Edit** | Node selected: edit its fields. Arrow selected: change the relationship type |
 | **Delete** | Node selected: remove it and its connections. Arrow selected: remove just that relationship |
-| **Save** | Persist the plan to disk (also auto-saved on close while it holds local work) |
+| **− ⊙ +** / **Ctrl+wheel** | Zoom out / reset / in (40–200%); drag **empty space** to pan around large graphs |
+| **Save** | Persist the plan to disk (also auto-saved on close while it holds local work; a plan with no local work left is cleaned up instead) |
 | **Push to Jira** | Apply everything — creations, edits, removals — to Jira (see below) |
 
 Edges are drawn with **arrowheads** so direction is clear (hierarchy points parent → child; a
@@ -347,6 +351,10 @@ listing any failures.
 > **Disabling the planner.** Set the environment variable `JIRAMAXX_DISABLE_PLANNER` (to any
 > value) to hide the **G** button and shortcut for a given deployment. Unset it to bring the
 > feature back.
+
+> **Offline note.** The relationship dropdown's link types are fetched from Jira **once per
+> installation** and cached at `<data folder>/link_types.yaml`; delete that file to force a
+> refresh (e.g. after an admin adds a new link type).
 
 ---
 

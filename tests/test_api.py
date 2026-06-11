@@ -57,13 +57,60 @@ def test_jql_str_escapes_backslash_then_quote():
 
 
 def test_search_issues_key_vs_text():
-    c, s = make_client([FakeResponse({'issues': []}), FakeResponse({'issues': []})])
-    c.search_issues('PROJ', 'PAY-12')
+    # Key-shaped queries go straight to the issue endpoint (JQL `key =`
+    # *errors* on a nonexistent key instead of returning nothing); free text
+    # runs a summary JQL match plus a recent-window substring scan.
+    c, s = make_client([FakeResponse({'key': 'PAY-12'}),
+                        FakeResponse({'issues': []}),    # summary match
+                        FakeResponse({'issues': []})])   # recent window
+    out_key = c.search_issues('PROJ', 'PAY-12')
     c.search_issues('PROJ', 'fix "login"')
-    jql_key = s.calls[0][2]['jql']
+    assert s.calls[0][1].endswith('/rest/api/3/issue/PAY-12')
+    assert out_key == [{'key': 'PAY-12'}]
     jql_text = s.calls[1][2]['jql']
-    assert jql_key.startswith('key = "PAY-12"')
+    # Multi-word terms get no wildcard (JQL forbids wildcards in phrases) and
+    # never a leading * (Jira treats that as match-nothing, not a wildcard).
     assert 'project = "PROJ"' in jql_text and 'summary ~ "fix \\"login\\""' in jql_text
+
+
+def test_search_issues_single_word_gets_prefix_wildcard():
+    c, s = make_client([FakeResponse({'issues': []}), FakeResponse({'issues': []})])
+    c.search_issues('PROJ', 'TESTEPIC')
+    assert 'summary ~ "TESTEPIC*"' in s.calls[0][2]['jql']
+    assert '*TESTEPIC' not in s.calls[0][2]['jql']   # never a leading wildcard
+
+
+def test_search_issues_infix_found_by_recent_scan_and_deduped():
+    hit = {'key': 'PROJ-9', 'fields': {'summary': 'TESTEPIC2 EPIC'}}
+    other = {'key': 'PROJ-1', 'fields': {'summary': 'unrelated'}}
+    # Server token search misses the infix term; the recent window has it.
+    c, s = make_client([FakeResponse({'issues': []}),
+                        FakeResponse({'issues': [other, hit]})])
+    out = c.search_issues('PROJ', 'EPIC2')
+    assert out == [hit]
+    # And when the summary match already returned it, the scan doesn't dupe it.
+    c2, _ = make_client([FakeResponse({'issues': [hit]}),
+                         FakeResponse({'issues': [hit, other]})])
+    assert c2.search_issues('PROJ', 'EPIC2') == [hit]
+
+
+def test_search_issues_numeric_infers_project_key():
+    c, s = make_client([FakeResponse({'key': 'PROJ-123'})])
+    out = c.search_issues('PROJ', '123')
+    assert s.calls[0][1].endswith('/rest/api/3/issue/PROJ-123')
+    assert out == [{'key': 'PROJ-123'}]
+
+
+def test_search_issues_missing_key_is_empty_not_error():
+    c, _ = make_client([FakeResponse({}, ok=False, status_code=404, reason='Not Found')])
+    assert c.search_issues('PROJ', '999') == []
+
+
+def test_search_issues_key_non404_propagates():
+    c, _ = make_client([FakeResponse({}, ok=False, status_code=500,
+                                     reason='Server Error')])
+    with pytest.raises(requests.exceptions.HTTPError):
+        c.search_issues('PROJ', 'PAY-1')
 
 
 def test_search_all_follows_next_page_token():
@@ -91,14 +138,26 @@ def test_every_request_has_a_timeout():
     assert all('timeout' in kw and kw['timeout'] for *_, kw in s.calls)
 
 
-def test_get_children_jql_uses_cf_syntax():
-    c, s = make_client([FakeResponse({'issues': []}), FakeResponse({'issues': []})])
+def test_get_children_jql_single_and_multi_key():
+    c, s = make_client([FakeResponse({'issues': []}),
+                        FakeResponse({'issues': []}),
+                        FakeResponse({'issues': []})])
     c.get_children('E-1', 'customfield_10014')
+    c.get_children(['E-1', 'E-2'], 'customfield_10014')
     c.get_children('E-1', None)
-    with_cf = s.calls[0][2]['jql']
-    without = s.calls[1][2]['jql']
-    assert 'parent = "E-1"' in with_cf and 'cf[10014] = "E-1"' in with_cf
-    assert 'cf[' not in without
+    single, multi, no_cf = (s.calls[i][2]['jql'] for i in range(3))
+    assert 'parent in ("E-1")' in single and 'cf[10014] in ("E-1")' in single
+    assert ('parent in ("E-1", "E-2")' in multi
+            and 'cf[10014] in ("E-1", "E-2")' in multi)
+    assert 'cf[' not in no_cf
+    assert c.get_children([], 'customfield_10014') == []  # no call for no keys
+
+
+def test_get_issues_by_keys_jql():
+    c, s = make_client([FakeResponse({'issues': []})])
+    c.get_issues_by_keys(['X-1', '', 'X-2'])
+    assert s.calls[0][2]['jql'] == 'key in ("X-1", "X-2")'
+    assert c.get_issues_by_keys([]) == []  # no call for no keys
 
 
 def test_create_issue_error_keeps_type_and_appends_payload():

@@ -150,8 +150,87 @@ def _build_field_row(field_name: str, ticket: Ticket) -> list:
 
 # ─── Ticket form ────────────────────────────────────────────────────────────
 
+def _title_cancel_prompt(title_text: str) -> str:
+    """'Return' / 'save' / 'discard' when type selection is cancelled mid-flow.
+    Returns 'return' | 'save' | 'discard'."""
+    layout = [
+        [sg.Text('Type selection cancelled.', font=('Helvetica', 10))],
+        [sg.Text(f'Title: "{title_text[:50]}"', font=('Helvetica', 9))],
+        [sg.HSep()],
+        [sg.Button('Save Draft', key='-SAVE-'),
+         sg.Button('Discard', key='-DISC-'),
+         sg.Button('Return to form', key='-RET-')],
+    ]
+    w = sg.Window('Unsaved title', layout, finalize=True, modal=True,
+                  keep_on_top=True, return_keyboard_events=False)
+    w.bind('<Escape>', '-RET-')
+    _enter_clicks_focused(w)
+    bring_to_front(w)
+    w['-RET-'].set_focus()
+    ev, _ = _read(w)
+    w.close()
+    return {'-SAVE-': 'save', '-DISC-': 'discard'}.get(ev, 'return')
+
+
+def _type_picker_dialog(current_type: str) -> str | None:
+    """Arrow-key navigable ticket type picker. Returns the chosen type name or None."""
+    types = list(TICKET_CLASSES.keys())
+    cur_idx = types.index(current_type) if current_type in types else 0
+    layout = [
+        [sg.Text('Select ticket type', font=('Helvetica', 11, 'bold'))],
+        [sg.Listbox(types, default_values=[types[cur_idx]], size=(30, len(types)),
+                    key='-T-', select_mode=sg.LISTBOX_SELECT_MODE_BROWSE,
+                    font=('Helvetica', 11))],
+        [sg.Push(),
+         sg.Button('Select', key='-OK-', bind_return_key=True),
+         sg.Button('Cancel', key='-C-')],
+    ]
+    w = sg.Window('Change type', layout, finalize=True, modal=True, keep_on_top=True)
+    w.bind('<Escape>', '-C-')
+    bring_to_front(w)
+    w['-T-'].set_focus()
+    # Make the tk listbox's *active* row the current type so the first arrow
+    # press moves from it (selection alone doesn't set the active row).
+    w['-T-'].Widget.activate(cur_idx)
+    ev, vals = _read(w)
+    w.close()
+    if ev == '-OK-' and vals.get('-T-'):
+        return vals['-T-'][0]
+    return None
+
+
+def _unsaved_changes_prompt() -> str:
+    """Three-way modal for unsaved changes on form close. 'Save' means save a
+    local draft — exiting should never force a Jira submit (which could bounce
+    on validation). Returns 'save' | 'discard' | 'return'."""
+    layout = [
+        [sg.Text('You have unsaved changes.', font=('Helvetica', 10))],
+        [sg.HSep()],
+        [sg.Button('Save Draft', key='-SAVE-'),
+         sg.Button('Discard', key='-DISC-'),
+         sg.Button('Return to form', key='-RET-')],
+    ]
+    w = sg.Window('Unsaved changes', layout, finalize=True, modal=True,
+                  keep_on_top=True, return_keyboard_events=False)
+    w.bind('<Escape>', '-RET-')
+    _enter_clicks_focused(w)
+    bring_to_front(w)
+    w['-RET-'].set_focus()
+    ev, _ = _read(w)
+    w.close()
+    return {'-SAVE-': 'save', '-DISC-': 'discard'}.get(ev, 'return')
+
+
+def _is_dirty(ticket: Ticket, orig: dict) -> bool:
+    curr = ticket.to_dict()
+    return any(str(curr.get(f, '') or '') != str(orig.get(f, '') or '')
+               for f in curr)
+
+
 def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dict) -> str:
     """Open a full ticket form. Returns 'submitted' | 'saved' | 'cancelled'."""
+    restart_with = None
+
     heading = f"{'Edit' if ticket.summary else 'New'} {ticket.ticket_type}"
     layout = [
         [sg.Text(heading, font=('Helvetica', 13, 'bold'))],
@@ -160,9 +239,10 @@ def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dic
         [sg.HSep()],
         [sg.Text('* required', font=('Helvetica', 8))],
         [sg.Push(),
-         sg.Button('Submit to Jira', key='-SUBMIT-', bind_return_key=False),
-         sg.Button('Save Draft',     key='-SAVE-'),
-         sg.Button('Cancel',         key='-CANCEL-')],
+         sg.Button('Change Type', key='-CHTYPE-'),
+         sg.Button('Submit to Jira',  key='-SUBMIT-', bind_return_key=False),
+         sg.Button('Save Draft',      key='-SAVE-'),
+         sg.Button('Cancel',          key='-CANCEL-')],
     ]
     window = sg.Window(f'Jira Tool – {ticket.ticket_type}', layout,
                        finalize=True, return_keyboard_events=False)
@@ -178,6 +258,8 @@ def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dic
     window.bind('<Control-Return>', '-SUBMIT-')
     window.bind('<Control-s>', '-SAVE-')
     window.bind('<Control-S>', '-SAVE-')
+    # No single-letter hotkey for Change Type: the form is all text inputs, and
+    # window-level letter binds fire even while an Input/Text has focus.
     for _f in ticket.all_form_fields():
         if FIELD_META.get(_f, {}).get('type') == 'multiline':
             window[_fkey(_f)].Widget.bind('<Tab>', _tab_out)
@@ -187,13 +269,46 @@ def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dic
     if _all_fields:
         window[_fkey(_all_fields[0])].set_focus()
 
+    # Snapshot for unsaved-changes detection (Change 4).
+    _orig = ticket.to_dict()
+
     result = 'cancelled'
     while True:
         event, values = _read(window)
-        if event in (sg.WIN_CLOSED, '-CANCEL-'):
+
+        # Apply form values at every iteration so ticket stays current (Change 4).
+        if event not in (sg.WIN_CLOSED,):
+            ticket.apply_form_values(values)
+
+        if event == sg.WIN_CLOSED:
+            # The window is already destroyed (X button), but `ticket` was kept
+            # current by the apply-every-event loop — the work is still savable.
+            if _is_dirty(ticket, _orig) and _yn_dialog(
+                    'Save your changes as a draft?', title='Unsaved changes'):
+                cache.save(ticket)
+                result = 'saved'
             break
 
-        ticket.apply_form_values(values)
+        if event == '-CANCEL-':
+            if _is_dirty(ticket, _orig):
+                action = _unsaved_changes_prompt()
+                if action == 'return':
+                    continue
+                if action == 'save':
+                    cache.save(ticket)
+                    result = 'saved'
+                break
+            break
+
+        if event == '-CHTYPE-':
+            new_type = _type_picker_dialog(ticket.ticket_type)
+            if new_type and new_type != ticket.ticket_type:
+                new_ticket = TICKET_CLASSES[new_type]()
+                for f in ('summary', 'description', 'priority', 'labels'):
+                    setattr(new_ticket, f, getattr(ticket, f, '') or '')
+                restart_with = new_ticket
+                break
+            continue
 
         if event == '-SAVE-':
             cache.save(ticket)
@@ -203,6 +318,16 @@ def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dic
             break
 
         if event == '-SUBMIT-':
+            # "me" assignee needs a configured account ID — keep the form open
+            # so the user can fix the field or save a draft (nothing is lost).
+            if ((getattr(ticket, 'assignee', '') or '').strip().lower() == 'me'
+                    and not ((config.get('jira') or {}).get('my_account_id') or '').strip()):
+                show_error(
+                    'Account ID is not configured.\n\n'
+                    'Go to Settings → Jira Settings and enter your Jira Account ID\n'
+                    'before assigning tickets to yourself with "me".',
+                    title='Missing Account ID')
+                continue
             valid, missing = ticket.is_valid()
             if not valid:
                 show_error("Missing required fields:\n  " + '\n  '.join(missing),
@@ -227,6 +352,11 @@ def show_ticket_form(ticket: Ticket, cache: Cache, jira: JiraClient, config: dic
                 show_error(f"Jira API error:\n{exc}", tb=_tb.format_exc(), title='Error')
 
     window.close()
+
+    # Change 5: type-change restart (tail-call).
+    if restart_with is not None:
+        return show_ticket_form(restart_with, cache, jira, config)
+
     return result
 
 
@@ -254,14 +384,17 @@ def show_type_selector() -> str | None:
 # ─── Title-first new ticket flow (also powers "Create Subtask") ───────────────
 
 def show_new_ticket_flow(cache: Cache, jira: JiraClient, config: dict,
-                         parent_key: str | None = None) -> None:
+                         parent_key: str | None = None,
+                         initial_title: str = '') -> None:
     """Title-first creation: one title field, then Save (quick-save a Task draft),
     Edit (pick a type → full form), or Cancel. ``parent_key`` makes the result a
-    subtask of that issue (carried via Ticket.parent into the Jira payload)."""
+    subtask of that issue (carried via Ticket.parent into the Jira payload).
+    ``initial_title`` pre-fills the field (set when 'Return to form' re-enters
+    after a cancelled type selection, so the typed title isn't lost)."""
     heading = f'New Subtask of {parent_key}' if parent_key else 'New Ticket'
     layout = [
         [sg.Text(heading, font=('Helvetica', 13, 'bold'))],
-        [sg.Text('Title:', size=(6, 1)), sg.Input('', key='-TITLE-', size=(50, 1))],
+        [sg.Text('Title:', size=(6, 1)), sg.Input(initial_title, key='-TITLE-', size=(50, 1))],
         [sg.HSep()],
         [sg.Push(),
          sg.Button('Save (Ctrl+S)', key='-SAVE-'),
@@ -307,6 +440,23 @@ def show_new_ticket_flow(cache: Cache, jira: JiraClient, config: dict,
             if parent_key:
                 ticket.parent = parent_key
             show_ticket_form(ticket, cache, jira, config)
+        else:
+            # Type selection was cancelled — ask user what to do with the title.
+            decision = _title_cancel_prompt(title)
+            if decision == 'save':
+                ticket = Task()
+                ticket.summary = title
+                if parent_key:
+                    ticket.parent = parent_key
+                cache.save(ticket)
+                sg.popup_quick_message('Draft saved.', auto_close_duration=1,
+                                       background_color='#2e7d32', text_color='white')
+            elif decision == 'discard':
+                return
+            else:
+                # 'return' — re-enter the title form with the title preserved.
+                show_new_ticket_flow(cache, jira, config, parent_key=parent_key,
+                                     initial_title=title)
 
 
 # ─── Draft list ─────────────────────────────────────────────────────────────
@@ -332,6 +482,37 @@ def _sort_drafts(drafts: list[Ticket], order: str) -> list[Ticket]:
     return sorted(drafts, key=lambda t: t.created_at, reverse=True)  # newest first
 
 
+def _enter_clicks_focused(w: sg.Window) -> None:
+    """Make <Return> activate the *focused* button (tk buttons only honor
+    <Space> natively), so Tab→Enter keyboard flows work in confirmation
+    dialogs. Only for button-only dialogs — don't use where Inputs need Enter."""
+    def _h(e):
+        if hasattr(e.widget, 'invoke'):
+            e.widget.invoke()
+            return 'break'
+    w.TKroot.bind('<Return>', _h)
+
+
+def _yn_dialog(message: str, title: str = '') -> bool:
+    """Yes/No confirmation with keyboard support.
+    Enter fires the focused button (Yes by default); Tab moves focus to No."""
+    layout = [
+        [sg.Text(message, font=('Helvetica', 10))],
+        [sg.Push(),
+         sg.Button('Yes', key='-YES-'),
+         sg.Button('No', key='-NO-')],
+    ]
+    w = sg.Window(title or 'Confirm', layout, finalize=True, modal=True,
+                  keep_on_top=True, return_keyboard_events=False)
+    w.bind('<Escape>', '-NO-')
+    _enter_clicks_focused(w)
+    bring_to_front(w)
+    w['-YES-'].set_focus()
+    ev, _ = _read(w)
+    w.close()
+    return ev == '-YES-'
+
+
 def _order_popup(options: list[str], current: str) -> str | None:
     """Tiny modal to pick a sort order. Returns the chosen option or None."""
     layout = [
@@ -346,6 +527,25 @@ def _order_popup(options: list[str], current: str) -> str | None:
     ev, vals = _read(w)
     w.close()
     return vals.get('-O-') if ev == '-A-' else None
+
+
+def _comment_popup(issue_key: str) -> str | None:
+    """Single-line comment prompt. Returns the text, or None if cancelled."""
+    layout = [
+        [sg.Text(f'Comment for {issue_key}:', font=('Helvetica', 11, 'bold'))],
+        [sg.Input('', key='-CMT-', size=(60, 1))],
+        [sg.Push(), sg.Button('Add', key='-OK-'), sg.Button('Cancel', key='-C-')],
+    ]
+    w = sg.Window('Add Comment', layout, finalize=True, modal=True, keep_on_top=True)
+    w.bind('<Escape>', '-C-')
+    w.bind('<Return>', '-OK-')
+    bring_to_front(w)
+    w['-CMT-'].set_focus()
+    ev, vals = _read(w)
+    w.close()
+    if ev == '-OK-':
+        return (vals.get('-CMT-') or '').strip() or None
+    return None
 
 
 def show_draft_list(drafts: list[Ticket], cache: Cache,
@@ -411,8 +611,7 @@ def show_draft_list(drafts: list[Ticket], cache: Cache,
                 prompt = (f'Delete these {n} drafts?' if n > 1
                           else f"Delete '{drafts[idxs[0]].summary or '(no title)'}'?")
                 # keep_on_top so the confirmation sits above the (keep-on-top) list.
-                if sg.popup_yes_no(prompt, title='Delete drafts',
-                                   modal=True, keep_on_top=True) == 'Yes':
+                if _yn_dialog(prompt, title='Delete drafts'):
                     for i in reversed(idxs):  # delete high→low to keep indices valid
                         cache.delete(drafts[i].ticket_id)
                         drafts.pop(i)
@@ -752,6 +951,18 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
                 elem.update(select_rows=[0])
             try:
                 elem.Widget.focus_set()
+                # Arrow keys need the Treeview focus *item*, not just widget focus.
+                if state['view'] == 'flat':
+                    kids = elem.Widget.get_children()
+                    if kids:
+                        elem.Widget.focus(kids[0])
+                else:
+                    tops = elem.Widget.get_children()
+                    if tops:
+                        leaves = elem.Widget.get_children(tops[0])
+                        first = leaves[0] if leaves else tops[0]
+                        elem.Widget.focus(first)
+                        elem.Widget.selection_set(first)
             except Exception:
                 pass
 
@@ -789,8 +1000,7 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
                 continue
 
             if event == '-COMMENT-':
-                comment = sg.popup_get_text(f'Comment for {issue_key}:',
-                                            title='Add Comment', size=(60, 1))
+                comment = _comment_popup(issue_key)
                 if comment:
                     try:
                         jira.add_comment(issue_key, comment)
@@ -842,7 +1052,7 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
                    disabled=len(drafts) == 0)],
         [sg.Button('(M) Manage Tickets', key='-MANAGE-', size=(18, 2)),
          sg.Button('(C) Config',         key='-CONFIG-', size=(18, 2))],
-        *([[sg.Button('(G) Plan Initiative', key='-PLAN-',  size=(38, 2))]]
+        *([[sg.Button('(G) Plan Initiative', key='-PLAN-',  size=(38, 1))]]
           if planner_enabled else []),
         [sg.Button('(Q) Quit',           key='-QUIT-',   size=(38, 1))],
     ]

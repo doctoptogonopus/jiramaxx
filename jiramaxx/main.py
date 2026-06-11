@@ -11,7 +11,6 @@ Usage:
 from __future__ import annotations
 import copy
 import queue
-import shutil
 import sys
 import threading
 from pathlib import Path
@@ -29,8 +28,6 @@ from .ui import run_main_window, show_interaction_window
 # site-packages is often read-only (and shared) for pip installs, and credentials
 # do not belong there.
 CONFIG_PATH = Path.home() / '.jiramaxx' / 'config.yaml'
-# Old scattered drafts location, retired in favor of one folder under base_dir.
-LEGACY_CACHE_DIR = Path.home() / '.jira_tool' / 'cache'
 
 DEFAULT_CONFIG: dict = {
     'jira': {
@@ -76,26 +73,13 @@ DEFAULT_CONFIG: dict = {
 
 
 def data_dir(config: dict) -> Path:
-    """Resolve the drafts directory. Honors an explicit, non-legacy
-    ``cache.directory`` for back-compat; otherwise derives ``<base_dir>/drafts``."""
+    """Resolve the drafts directory. Honors an explicit ``cache.directory`` for
+    back-compat; otherwise derives ``<base_dir>/drafts``."""
     explicit = (config.get('cache') or {}).get('directory')
     if explicit:
-        p = Path(explicit).expanduser()
-        if p != LEGACY_CACHE_DIR:
-            return p
+        return Path(explicit).expanduser()
     base = (config.get('paths') or {}).get('base_dir') or '~/.jiramaxx'
     return Path(base).expanduser() / 'drafts'
-
-
-def migrate_legacy_cache(target: Path) -> None:
-    """One-time relocation of old ~/.jira_tool/cache drafts into the new folder."""
-    if target.exists() or not LEGACY_CACHE_DIR.exists():
-        return
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(LEGACY_CACHE_DIR), str(target))
-    except Exception:
-        pass
 
 
 def enable_system_certs(config: dict) -> None:
@@ -139,6 +123,15 @@ def load_config() -> dict:
     return _merge_defaults(data if isinstance(data, dict) else {}, DEFAULT_CONFIG)
 
 
+def save_config(config: dict) -> None:
+    """Persist a (merged) config dict to ``CONFIG_PATH``. Writing the merged
+    dict is the established pattern (config_ui's Save does the same)."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False,
+                  allow_unicode=True)
+
+
 def is_configured(config: dict) -> bool:
     return bool(resolve_token(config.get('jira', {})))
 
@@ -159,9 +152,7 @@ def _prompt_setup(config: dict) -> dict:
 
 
 def build_clients(config: dict) -> tuple[Cache, JiraClient]:
-    ddir = data_dir(config)
-    migrate_legacy_cache(ddir)
-    cache = Cache(str(ddir))
+    cache = Cache(str(data_dir(config)))
     jira = JiraClient.from_config(config)
     return cache, jira
 
