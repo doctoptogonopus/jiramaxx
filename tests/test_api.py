@@ -57,13 +57,60 @@ def test_jql_str_escapes_backslash_then_quote():
 
 
 def test_search_issues_key_vs_text():
-    c, s = make_client([FakeResponse({'issues': []}), FakeResponse({'issues': []})])
-    c.search_issues('PROJ', 'PAY-12')
+    # Key-shaped queries go straight to the issue endpoint (JQL `key =`
+    # *errors* on a nonexistent key instead of returning nothing); free text
+    # runs a summary JQL match plus a recent-window substring scan.
+    c, s = make_client([FakeResponse({'key': 'PAY-12'}),
+                        FakeResponse({'issues': []}),    # summary match
+                        FakeResponse({'issues': []})])   # recent window
+    out_key = c.search_issues('PROJ', 'PAY-12')
     c.search_issues('PROJ', 'fix "login"')
-    jql_key = s.calls[0][2]['jql']
+    assert s.calls[0][1].endswith('/rest/api/3/issue/PAY-12')
+    assert out_key == [{'key': 'PAY-12'}]
     jql_text = s.calls[1][2]['jql']
-    assert jql_key.startswith('key = "PAY-12"')
+    # Multi-word terms get no wildcard (JQL forbids wildcards in phrases) and
+    # never a leading * (Jira treats that as match-nothing, not a wildcard).
     assert 'project = "PROJ"' in jql_text and 'summary ~ "fix \\"login\\""' in jql_text
+
+
+def test_search_issues_single_word_gets_prefix_wildcard():
+    c, s = make_client([FakeResponse({'issues': []}), FakeResponse({'issues': []})])
+    c.search_issues('PROJ', 'TESTEPIC')
+    assert 'summary ~ "TESTEPIC*"' in s.calls[0][2]['jql']
+    assert '*TESTEPIC' not in s.calls[0][2]['jql']   # never a leading wildcard
+
+
+def test_search_issues_infix_found_by_recent_scan_and_deduped():
+    hit = {'key': 'PROJ-9', 'fields': {'summary': 'TESTEPIC2 EPIC'}}
+    other = {'key': 'PROJ-1', 'fields': {'summary': 'unrelated'}}
+    # Server token search misses the infix term; the recent window has it.
+    c, s = make_client([FakeResponse({'issues': []}),
+                        FakeResponse({'issues': [other, hit]})])
+    out = c.search_issues('PROJ', 'EPIC2')
+    assert out == [hit]
+    # And when the summary match already returned it, the scan doesn't dupe it.
+    c2, _ = make_client([FakeResponse({'issues': [hit]}),
+                         FakeResponse({'issues': [hit, other]})])
+    assert c2.search_issues('PROJ', 'EPIC2') == [hit]
+
+
+def test_search_issues_numeric_infers_project_key():
+    c, s = make_client([FakeResponse({'key': 'PROJ-123'})])
+    out = c.search_issues('PROJ', '123')
+    assert s.calls[0][1].endswith('/rest/api/3/issue/PROJ-123')
+    assert out == [{'key': 'PROJ-123'}]
+
+
+def test_search_issues_missing_key_is_empty_not_error():
+    c, _ = make_client([FakeResponse({}, ok=False, status_code=404, reason='Not Found')])
+    assert c.search_issues('PROJ', '999') == []
+
+
+def test_search_issues_key_non404_propagates():
+    c, _ = make_client([FakeResponse({}, ok=False, status_code=500,
+                                     reason='Server Error')])
+    with pytest.raises(requests.exceptions.HTTPError):
+        c.search_issues('PROJ', 'PAY-1')
 
 
 def test_search_all_follows_next_page_token():

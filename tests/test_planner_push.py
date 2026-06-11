@@ -325,8 +325,9 @@ def test_apply_relationship_child_parent_link():
     edges2: list = []
     _apply_relationship(edges2, src, other,
                         {'category': 'link', 'rel': 'Blocks', 'reverse': True})
-    assert edges2 == [{'from': src['node_id'], 'to': other['node_id'],
-                       'category': 'link', 'rel': 'Blocks', 'reverse': True}]
+    # reverse=True → swap from/to and store canonical (reverse=False)
+    assert edges2 == [{'from': other['node_id'], 'to': src['node_id'],
+                       'category': 'link', 'rel': 'Blocks', 'reverse': False}]
 
 
 def test_edge_at_point_geometry():
@@ -688,3 +689,258 @@ def test_plan_label_columns_aligned():
     lbl_plain = _plan_label(p_plain, 'PAY')
     # Both prefixes are exactly 2 chars ('* ' vs '  ').
     assert len(lbl_star[:2]) == len(lbl_plain[:2]) == 2
+
+
+# ── Review-round helpers: migration, layout, options, epic inheritance ───────
+
+from jiramaxx.planner import (_auto_layout, _can_be_parent,
+                              _epic_inherit_candidates, _existing_node,
+                              _migrate_plan, _relationship_options)
+
+_LINK_TYPES = [{'name': 'Relates', 'inward': 'relates to', 'outward': 'relates to'},
+               {'name': 'Blocks', 'inward': 'is blocked by', 'outward': 'blocks'}]
+
+
+def test_migrate_plan_normalizes_reverse_link_edges():
+    p = plan_with([], [
+        {'from': 'a', 'to': 'b', 'category': 'link', 'rel': 'Blocks',
+         'reverse': True, 'pushed': True, 'link_id': '9'},
+        {'from': 'c', 'to': 'd', 'category': 'link', 'rel': 'Blocks', 'reverse': False},
+        {'from': 'e', 'to': 'f', 'category': 'hierarchy', 'rel': 'epic-child',
+         'reverse': True},   # hierarchy never reversed — left alone
+    ])
+    _migrate_plan(p)
+    assert p['edges'][0] == {'from': 'b', 'to': 'a', 'category': 'link',
+                             'rel': 'Blocks', 'reverse': False,
+                             'pushed': True, 'link_id': '9'}
+    assert p['edges'][1]['from'] == 'c'                     # untouched
+    assert p['edges'][2]['from'] == 'e'                     # untouched
+
+
+def test_auto_layout_epic_alone_on_top_centered():
+    epic = epic_node()
+    s1, s2 = story_node('s1'), story_node('s2')
+    t1 = task_node('t1')
+    floater = task_node('blocker')   # dependency-only — no hierarchy edges
+    edges = []
+    _set_parent_edge(edges, epic, s1)
+    _set_parent_edge(edges, epic, s2)
+    _set_parent_edge(edges, s1, t1)
+    edges.append({'from': floater['node_id'], 'to': s1['node_id'],
+                  'category': 'link', 'rel': 'Blocks'})
+    nodes = [epic, s1, s2, t1, floater]
+    _auto_layout(nodes, edges)
+    rows = {n['node_id']: n['y'] for n in nodes}
+    # Epic alone on the top row.
+    top = min(rows.values())
+    assert rows[epic['node_id']] == top
+    assert [nid for nid, y in rows.items() if y == top] == [epic['node_id']]
+    # Children one row down; grandchild below them; floater below everything.
+    assert rows[s1['node_id']] == rows[s2['node_id']] > top
+    assert rows[t1['node_id']] > rows[s1['node_id']]
+    assert rows[floater['node_id']] > rows[t1['node_id']]
+    # Epic horizontally centered over its two subtrees.
+    xs = sorted([s1['x'], s2['x']])
+    assert xs[0] <= epic['x'] <= xs[1]
+
+
+def test_relationship_options_epic_vs_story_defaults():
+    state = {'link_types': _LINK_TYPES}
+    epic, story = epic_node(), story_node('s')
+    epic_opts = _relationship_options(None, None, state, source_node=epic)
+    assert epic_opts[0][1] == {'category': 'hierarchy', 'dir': 'child'}
+    story_opts = _relationship_options(None, None, state, source_node=story)
+    labels = [lbl for lbl, _ in story_opts]
+    # No Child option for a Story source; the default (first) is the
+    # outward 'relates to' phrase.
+    assert all(p.get('dir') != 'child' for _, p in story_opts)
+    assert story_opts[0][1] == {'category': 'link', 'rel': 'Relates',
+                                'reverse': False}
+    assert any(p == {'category': 'hierarchy', 'dir': 'parent'}
+               for _, p in story_opts)
+
+
+def test_relationship_options_parent_filtered_by_target():
+    state = {'link_types': _LINK_TYPES}
+    story, task = story_node('s'), task_node('t')
+    # Target is a Task — nesting under it is invalid, Parent disappears.
+    opts = _relationship_options(None, None, state,
+                                 source_node=story, target_node=task)
+    assert all(p.get('category') != 'hierarchy' for _, p in opts)
+
+
+def test_can_be_parent_types():
+    assert _can_be_parent(epic_node())
+    assert _can_be_parent(None)          # unknown target — decided later
+    assert not _can_be_parent(story_node('s'))
+    assert not _can_be_parent(task_node('t'))
+
+
+def _node_issue(key, summary='x', itype='Story', parent=None, epic=None):
+    f = {'summary': summary, 'issuetype': {'name': itype}}
+    if parent:
+        f['parent'] = {'key': parent}
+    if epic:
+        f['customfield_10014'] = epic
+    return {'key': key, 'fields': f}
+
+
+def test_existing_node_captures_parent_key():
+    n_parent = _existing_node(_node_issue('T-2', parent='T-1'), 0, 0,
+                              epic_cf='customfield_10014')
+    assert n_parent['parent_key'] == 'T-1'
+    n_epic = _existing_node(_node_issue('T-3', epic='T-9'), 0, 0,
+                            epic_cf='customfield_10014')
+    assert n_epic['parent_key'] == 'T-9'
+    n_free = _existing_node(_node_issue('T-4'), 0, 0, epic_cf='customfield_10014')
+    assert 'parent_key' not in n_free
+
+
+def test_epic_inherit_candidates_defaults():
+    epic = epic_node()
+    epic['jira_key'] = 'T-1'
+    direct = story_node('direct child')          # hierarchy child of the epic
+    deep_draft = task_node('deep draft')         # link-attached draft
+    in_tree = _existing_node(_node_issue('T-5', parent='T-1'), 0, 0,
+                             epic_cf='customfield_10014')
+    other_epic = _existing_node(_node_issue('T-7', epic='OTHER-1'), 0, 0,
+                                epic_cf='customfield_10014')
+    unassigned = _existing_node(_node_issue('T-8'), 0, 0,
+                                epic_cf='customfield_10014')
+    edges = []
+    _set_parent_edge(edges, epic, direct)
+    edges.append({'from': direct['node_id'], 'to': deep_draft['node_id'],
+                  'category': 'link', 'rel': 'Relates'})
+    nodes = [epic, direct, deep_draft, in_tree, other_epic, unassigned]
+    cands = dict(_epic_inherit_candidates(nodes, edges, epic))
+    assert epic['node_id'] not in cands          # the root itself
+    assert direct['node_id'] not in cands        # direct child: edge handles it
+    assert cands[deep_draft['node_id']] is True  # draft → checked
+    assert cands[in_tree['node_id']] is True     # parent inside the plan
+    assert cands[other_epic['node_id']] is False # belongs to another epic
+    assert cands[unassigned['node_id']] is True  # no epic → attach to root
+
+
+def test_push_story_task_via_link_keeps_task_parentless():
+    """The user's Epic→Story→Task scenario: with the Epic-only hierarchy rule
+    the Story–Task connection is a link, so the Task creates cleanly (no
+    invalid `parent` field) and its dependency link lands after the creates."""
+    epic, story, task = epic_node(), story_node('story A'), task_node('task B')
+    edges = []
+    _set_parent_edge(edges, epic, story)
+    edges.append({'from': story['node_id'], 'to': task['node_id'],
+                  'category': 'link', 'rel': 'Relates', 'reverse': False})
+    plan = plan_with([epic, story, task], edges)
+    jira = FakeJira()
+    msg, clean = _push_plan_to_jira(jira, CONFIG, plan)
+    assert clean
+    by_summary = {p['fields']['summary']: p['fields'] for _, p in jira.created}
+    assert 'parent' not in by_summary['task B']
+    assert 'customfield_10014' not in by_summary['task B']
+    assert len(jira.links) == 1 and jira.links[0][2] == 'Relates'
+    # And the task is offered (checked) for epic inheritance.
+    cands = dict(_epic_inherit_candidates(plan['nodes'], plan['edges'], epic))
+    assert cands[task['node_id']] is True
+
+
+# ── Epic inheritance through the push (required-field configs) ───────────────
+
+from contextlib import contextmanager
+
+from jiramaxx.models import init_ticket_config
+from jiramaxx.planner import _incomplete_nodes, _push_supplied_fields
+
+
+@contextmanager
+def _epic_required_on_task():
+    """Temporarily make epic_link a required Task field (mirrors the user's
+    config that surfaced the bug)."""
+    init_ticket_config({'Task': {'required': ['summary', 'description', 'epic_link'],
+                                 'optional': []}})
+    try:
+        yield
+    finally:
+        init_ticket_config({})
+
+
+def test_incomplete_nodes_exempts_push_supplied_epic():
+    with _epic_required_on_task():
+        epic, story = epic_node(), story_node('s')
+        linked_task = task_node('linked task')      # gets epic via inheritance
+        loose_task = task_node('loose task')        # gets it from nothing — flagged
+        edges = []
+        _set_parent_edge(edges, epic, story)
+        edges.append({'from': story['node_id'], 'to': linked_task['node_id'],
+                      'category': 'link', 'rel': 'Relates', 'reverse': False})
+        plan = plan_with([epic, story, linked_task, loose_task], edges)
+
+        # Without inheritance both tasks are missing epic_link.
+        flagged = '\n'.join(_incomplete_nodes(plan))
+        assert 'linked task' in flagged and 'loose task' in flagged
+        # Checked for inheritance → the push supplies epic_link; only the
+        # unchecked task stays blocked.
+        flagged = '\n'.join(_incomplete_nodes(plan, [linked_task['node_id']]))
+        assert 'linked task' not in flagged and 'loose task' in flagged
+        supplied = _push_supplied_fields(plan, [linked_task['node_id']])
+        assert supplied[story['node_id']] == {'epic_link'}   # from its edge
+        assert supplied[linked_task['node_id']] == {'epic_link'}
+
+
+def test_push_inherit_draft_created_with_epic_after_epic():
+    """The reported bug: a draft attached to a *child* of the epic must be
+    creatable with epic_link required, and must land in Jira already pointing
+    at the root epic — exactly like a direct child does."""
+    with _epic_required_on_task():
+        epic, story, task = epic_node(), story_node('s'), task_node('deep task')
+        edges = []
+        _set_parent_edge(edges, epic, story)
+        edges.append({'from': story['node_id'], 'to': task['node_id'],
+                      'category': 'link', 'rel': 'Relates', 'reverse': False})
+        # Task listed FIRST: the create loop must still wait for the epic.
+        plan = plan_with([task, epic, story], edges)
+        jira = FakeJira()
+        msg, clean = _push_plan_to_jira(jira, CONFIG, plan,
+                                        inherit_ids=[task['node_id']])
+        assert clean, msg
+        order = [p['fields']['summary'] for _, p in jira.created]
+        assert order.index('Big epic') < order.index('deep task')
+        by_summary = {p['fields']['summary']: p['fields'] for _, p in jira.created}
+        epic_key = jira.created[order.index('Big epic')][0]
+        assert by_summary['deep task']['customfield_10014'] == epic_key
+        assert task['parent_key'] == epic_key   # repush will skip it
+
+
+def test_implied_epic_edges_hidden_only_when_child_has_links():
+    from jiramaxx.planner import _implied_epic_edges
+    epic = epic_node()
+    quiet = story_node('only the epic edge')   # sole relationship → arrow stays
+    busy = story_node('linked elsewhere')      # also has a link → arrow hidden
+    helper = task_node('helper')
+    edges = []
+    _set_parent_edge(edges, epic, quiet)       # idx 0
+    _set_parent_edge(edges, epic, busy)        # idx 1
+    edges.append({'from': busy['node_id'], 'to': helper['node_id'],
+                  'category': 'link', 'rel': 'Relates', 'reverse': False})
+    nodes = [epic, quiet, busy, helper]
+    assert _implied_epic_edges(nodes, edges) == {1}
+    # Non-root hierarchy edges are never hidden, and no epic ⇒ nothing hidden.
+    assert _implied_epic_edges([quiet, busy, helper], edges[2:]) == set()
+
+
+def test_push_inherit_existing_node_updated_once():
+    epic = epic_node()
+    epic['kind'] = 'existing'
+    epic['jira_key'] = 'T-100'
+    existing = task_node('already real')
+    existing['kind'] = 'existing'
+    existing['jira_key'] = 'T-200'
+    plan = plan_with([epic, existing], [])
+    jira = FakeJira()
+    _, clean = _push_plan_to_jira(jira, CONFIG, plan,
+                                  inherit_ids=[existing['node_id']])
+    assert clean
+    assert jira.updated == [('T-200', {'customfield_10014': 'T-100'})]
+    assert existing['parent_key'] == 'T-100'
+    # Repush: parent_key now matches the epic — no second update.
+    _push_plan_to_jira(jira, CONFIG, plan, inherit_ids=[existing['node_id']])
+    assert len(jira.updated) == 1

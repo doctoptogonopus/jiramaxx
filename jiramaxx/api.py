@@ -234,17 +234,53 @@ class JiraClient:
         return self._put(f'/rest/api/3/issue/{issue_key}', {'fields': fields})
 
     def search_issues(self, project_key: str, text: str, max_total: int = 50) -> list[dict]:
-        """Live search for existing issues. A key-looking term (e.g. ``PAY-12``)
-        matches by key; anything else does a summary text search within the project.
+        """Live search for existing issues. A key-looking term (e.g. ``PAY-12``
+        or a bare ticket number) resolves via the issue endpoint; free text
+        combines a server-side token/prefix JQL match with a client-side
+        substring scan of the project's recently updated issues. The scan is
+        what makes infix terms work ('EPIC2' finding 'TESTEPIC2'): Jira's
+        Lucene search has no infix support — a leading ``*`` isn't treated as
+        a wildcard, it just matches nothing.
         Returns raw issue dicts (key + summary/issuetype/status fields)."""
         text = (text or '').strip()
-        if re.match(r'^[A-Za-z][A-Za-z0-9]*-\d+$', text):
-            jql = f'key = "{_jql_str(text)}"'
-        else:
-            jql = (f'project = "{_jql_str(project_key)}" '
-                   f'AND summary ~ "{_jql_str(text)}"')
-        return self._search_all(jql + ' ORDER BY updated DESC',
-                                'summary,issuetype,status', max_total=max_total)
+        fields = 'summary,issuetype,status'
+        # Key-shaped queries resolve via the issue endpoint, not JQL: Jira
+        # *validates* `key =` clauses and returns HTTP 400 (not an empty result)
+        # when the key doesn't exist, which would turn every typo into an error.
+        key = None
+        if re.match(r'^\d+$', text):
+            # Pure numeric → a ticket number in the configured project
+            key = f'{project_key}-{text}'
+        elif re.match(r'^[A-Za-z][A-Za-z0-9]*-\d+$', text):
+            key = text.upper()
+        if key:
+            try:
+                return [self.get_issue(key, fields=fields)]
+            except requests.exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) == 404:
+                    return []   # no such ticket — an empty result, not an error
+                raise
+        # Server side: token match; a trailing * widens a single word to a
+        # token *prefix* (valid JQL — wildcards can't be mixed into multi-word
+        # phrases, so those search as plain phrases).
+        term = _jql_str(text) + ('*' if text and ' ' not in text else '')
+        proj = _jql_str(project_key)
+        found = self._search_all(
+            f'project = "{proj}" AND summary ~ "{term}" ORDER BY updated DESC',
+            fields, max_total=max_total)
+        # Client side: substring-scan the most recent issues so mid-word terms
+        # match too. Bounded window — very old tickets are only reachable by
+        # token/prefix terms or their key.
+        if len(found) < max_total:
+            seen = {i.get('key') for i in found}
+            needle = text.lower()
+            recent = self._search_all(
+                f'project = "{proj}" ORDER BY updated DESC',
+                fields, max_total=200)
+            found += [i for i in recent
+                      if i.get('key') not in seen and needle in
+                      ((i.get('fields') or {}).get('summary') or '').lower()]
+        return found[:max_total]
 
     def add_comment(self, issue_key: str, text: str) -> dict:
         return self._post(f'/rest/api/3/issue/{issue_key}/comment', {
