@@ -1,5 +1,52 @@
 import os
+import threading
+import traceback
 import PySimpleGUI as sg
+
+
+def run_with_busy(fn, message: str = 'Contacting Jira…', title: str = 'Working'):
+    """Run ``fn()`` on a daemon thread while the GUI stays responsive behind a
+    small modal "Working… [Cancel]" window. One thread per call, spawned only for
+    this user action and gone when the request finishes — nothing periodic or
+    idle. Cancel stops waiting and discards the eventual result (the request
+    itself is bounded by the api-module timeout).
+
+    Returns ``(status, value, tb)`` where status is ``'ok'`` (value = result),
+    ``'error'`` (value = exception, tb = formatted traceback for show_error), or
+    ``'cancelled'`` (value/tb = None).
+    """
+    box: dict = {}
+    done = threading.Event()
+
+    def _work():
+        try:
+            box['result'] = fn()
+        except Exception as exc:
+            box['exc'] = exc
+            box['tb'] = traceback.format_exc()
+        finally:
+            done.set()
+
+    threading.Thread(target=_work, daemon=True).start()
+    # Fast path: most calls finish in well under a beat — skip the popup flicker.
+    if not done.wait(0.25):
+        layout = [[sg.Text(message)],
+                  [sg.Push(), sg.Button('Cancel', key='-X-'), sg.Push()]]
+        win = sg.Window(title, layout, modal=True, keep_on_top=True,
+                        finalize=True, disable_close=False)
+        bring_to_front(win)
+        cancelled = False
+        while not done.is_set():
+            ev, _ = win.read(timeout=100)
+            if ev in (sg.WIN_CLOSED, '-X-'):
+                cancelled = True
+                break
+        win.close()
+        if cancelled:
+            return 'cancelled', None, None
+    if 'exc' in box:
+        return 'error', box['exc'], box.get('tb')
+    return 'ok', box.get('result'), None
 
 
 def _subdirs(path: str) -> list:

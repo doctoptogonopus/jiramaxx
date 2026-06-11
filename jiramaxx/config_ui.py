@@ -8,13 +8,16 @@ listboxes are display-only and refreshed after every action.
 """
 from __future__ import annotations
 import copy
+import traceback
 from pathlib import Path
 import yaml
 import PySimpleGUI as sg
 
-from .api import JiraClient, _network_kwargs, apply_proxy_env
-from .models import FIELD_META, TICKET_CLASSES, init_ticket_config, init_jira_config
-from .utils import safe_read, show_error, bring_to_front, pick_folder
+from .api import (JiraClient, _network_kwargs, apply_proxy_env,
+                  resolve_token, store_token, KEYRING_SENTINEL)
+from .models import (FIELD_META, TICKET_CLASSES, DEFAULT_SPRINT_CF,
+                     init_ticket_config, init_jira_config)
+from .utils import safe_read, show_error, bring_to_front, pick_folder, run_with_busy
 from .plugins import discover_plugins
 
 ALL_FIELDS = list(FIELD_META.keys())
@@ -25,7 +28,6 @@ _JIRA_KEYS = [
     ('API Token',     'jira.api_token'),
     ('User Email',    'jira.user_email'),
     ('Project Key',   'jira.project_key'),
-    ('Board ID',      'jira.board_id'),
     ('My Account ID', 'jira.my_account_id'),
     ('Token Type',    'jira.token_type'),
     ('Cloud ID',      'jira.cloud_id'),
@@ -63,17 +65,12 @@ _NETWORK_KEYS = [
     ('Proxy URL',            'network.proxy'),
 ]
 
+# Per-type fallback field lists come straight from the model classes (their
+# hardcoded `_default_*` properties), so there is one source of truth.
 _DEFAULTS: dict[str, dict] = {
-    'Story':      {'required': ['summary', 'description', 'story_points'],
-                   'optional': ['assignee', 'labels', 'sprint', 'epic_link', 'priority']},
-    'Bug':        {'required': ['summary', 'description', 'severity', 'steps_to_reproduce'],
-                   'optional': ['assignee', 'labels', 'priority']},
-    'Task':       {'required': ['summary', 'description'],
-                   'optional': ['assignee', 'story_points', 'labels', 'priority']},
-    'Epic':       {'required': ['summary', 'description', 'epic_name'],
-                   'optional': ['labels', 'priority']},
-    'Initiative': {'required': ['summary', 'description'],
-                   'optional': ['labels', 'priority']},
+    t: {'required': list(cls()._default_required),
+        'optional': list(cls()._default_optional)}
+    for t, cls in TICKET_CLASSES.items()
 }
 
 
@@ -94,24 +91,6 @@ def _nested_set(d: dict, dotkey: str, value):
     for k in keys[:-1]:
         cur = cur.setdefault(k, {})
     cur[keys[-1]] = value
-
-
-def _nested_get_d(config: dict, dotkey: str) -> str:
-    """Like _nested_get, but falls back to the DEFAULT_CONFIG value when the key is
-    unset — so fields with sensible defaults (data folder, theme, hotkeys, shortcuts,
-    release statuses) show their default instead of being blank."""
-    val = _nested_get(config, dotkey)
-    if val:
-        return val
-    from .main import DEFAULT_CONFIG
-    cur = DEFAULT_CONFIG
-    for k in dotkey.split('.'):
-        if not isinstance(cur, dict):
-            return ''
-        cur = cur.get(k)
-        if cur is None:
-            return ''
-    return str(cur)
 
 
 def _available_for(state: dict) -> list[str]:
@@ -200,8 +179,10 @@ def _jira_tab(config: dict) -> list:
 def _app_tab(config: dict) -> list:
     rows = []
     for label, key in _APP_KEYS:
+        # The defaults-merge in load_config guarantees these keys exist, so a
+        # plain nested lookup always shows the effective value.
         row = [sg.Text(label, size=(18, 1)),
-               sg.Input(_nested_get_d(config, key), key=f'-CFG-{key}-',
+               sg.Input(_nested_get(config, key), key=f'-CFG-{key}-',
                         size=(34, 1) if key == 'paths.base_dir' else (38, 1),
                         enable_events=True)]
         if key == 'paths.base_dir':
@@ -216,7 +197,7 @@ def _app_tab(config: dict) -> list:
                          font=('Helvetica', 8))])
     for label, key in _RELEASE_KEYS:
         rows.append([sg.Text(label, size=(30, 1)),
-                     sg.Input(_nested_get_d(config, key), key=f'-CFG-{key}-',
+                     sg.Input(_nested_get(config, key), key=f'-CFG-{key}-',
                               size=(26, 1), enable_events=True)])
     rows.append([sg.Button('Test statuses', key='-TEST-RELEASE-'),
                  sg.Text(_release_status_text(config), key='-RELEASE-STATUS-',
@@ -307,16 +288,20 @@ def _network_tab(config: dict) -> list:
 def show_config_window(config: dict, config_path: Path) -> dict | None:
     """Open the config editor. Returns updated config on save, None on cancel."""
     working = copy.deepcopy(config)
+    # Show the real token in the (masked) field even when it lives in the OS
+    # credential store, so Test Connection works and re-saving round-trips.
+    working.setdefault('jira', {})['api_token'] = resolve_token(working.get('jira', {}))
     type_fields = _init_type_fields(working)
     current_type = TICKET_TYPES[0]
 
+    def _net_from_values(v: dict) -> dict:
+        # Network settings from the live form so Test Connection / Browse /
+        # Discover use the proxy + CA bundle even before the user has saved.
+        return {'ca_bundle': (v.get('-CFG-network.ca_bundle-') or '').strip(),
+                'proxy':     (v.get('-CFG-network.proxy-') or '').strip()}
+
     def _make_client(v: dict) -> JiraClient:
-        # Pull network settings from the live form so Test Connection / Browse
-        # use the proxy + CA bundle even before the user has saved.
-        net = {
-            'ca_bundle': v.get('-CFG-network.ca_bundle-', '').strip(),
-            'proxy':     v.get('-CFG-network.proxy-', '').strip(),
-        }
+        net = _net_from_values(v)
         apply_proxy_env(net)
         return JiraClient(
             v.get('-CFG-jira.base_url-', '').strip(),
@@ -365,17 +350,27 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
     window.bind('<Escape>', '-CANCEL-')
     bring_to_front(window)
 
-    # Capture initial form state for change detection
-    _, _orig_vals = window.read(timeout=0)
+    # Capture initial form state for change detection. Values are read straight
+    # off the widgets — window.read(timeout=0) would consume (and silently drop)
+    # any event already queued.
     _CHANGED_BG = '#6B4300'
     _DEFAULT_BG = sg.theme_input_background_color()
     _cfg_keys = [f'-CFG-{k}-' for _, k in
                  _JIRA_KEYS + _CUSTOM_FIELD_KEYS + _APP_KEYS + _RELEASE_KEYS + _NETWORK_KEYS]
 
+    def _form_snapshot() -> dict:
+        snap = {}
+        for fkey in _cfg_keys:
+            try:
+                snap[fkey] = window[fkey].get()
+            except Exception:
+                pass
+        return snap
+
+    _orig_vals = _form_snapshot()
+
     def _highlight_changes():
-        _, cur = window.read(timeout=0)
-        if cur is None:
-            return
+        cur = _form_snapshot()
         for fkey in _cfg_keys:
             if fkey not in cur or fkey not in _orig_vals:
                 continue
@@ -400,7 +395,6 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                     _plugin_handled = True
                     break
             except Exception:
-                import traceback
                 show_error('Plugin config error.', tb=traceback.format_exc())
                 _plugin_handled = True
                 break
@@ -479,8 +473,7 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             elif not _cloud_id_ok(values):
                 pass
             else:
-                try:
-                    import traceback
+                def _test_connection():
                     tmp = _make_client(values)
                     me = tmp.get_myself()
                     lines = [f"Auth OK  →  {me.get('displayName', '?')} ({me.get('emailAddress', '?')})"]
@@ -492,11 +485,15 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                             lines.append(f"CREATE_ISSUES permission  →  {'✓ YES' if can_create else '✗ NO — this is why tickets fail'}")
                         except Exception as pe:
                             lines.append(f"Project  →  {proj}  ✗ not found or no access: {pe}")
-                    sg.popup('\n'.join(lines), title='Connection Test',
+                    return lines
+
+                status, res, tb = run_with_busy(_test_connection,
+                                                message='Testing connection…')
+                if status == 'ok':
+                    sg.popup('\n'.join(res), title='Connection Test',
                              font=('Courier', 10), modal=True, keep_on_top=True)
-                except Exception as exc:
-                    import traceback
-                    show_error(f"Connection failed:\n{exc}", tb=traceback.format_exc())
+                elif status == 'error':
+                    show_error(f"Connection failed:\n{res}", tb=tb)
 
         # ── Discover Cloud ID ──────────────────────────────────────────────
         elif event == '-DISCOVER-CLOUD-':
@@ -505,13 +502,16 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                 sg.popup('Fill in Base URL first.', title='Discover Cloud ID',
                          modal=True, keep_on_top=True)
             else:
-                try:
-                    cloud_id = JiraClient.discover_cloud_id(url)
-                    window['-CFG-jira.cloud_id-'].update(cloud_id)
-                except Exception as exc:
-                    import traceback
-                    show_error(f"Could not discover Cloud ID:\n{exc}",
-                               tb=traceback.format_exc())
+                # Same CA bundle / proxy treatment as every other live-form call.
+                net = _net_from_values(values)
+                apply_proxy_env(net)
+                status, cid, tb = run_with_busy(
+                    lambda: JiraClient.discover_cloud_id(url, **_network_kwargs(net)),
+                    message='Discovering Cloud ID…')
+                if status == 'ok':
+                    window['-CFG-jira.cloud_id-'].update(cid)
+                elif status == 'error':
+                    show_error(f"Could not discover Cloud ID:\n{cid}", tb=tb)
 
         # ── Browse Projects ────────────────────────────────────────────────
         elif event == '-BROWSE-PROJ-':
@@ -523,9 +523,12 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             elif not _cloud_id_ok(values):
                 pass
             else:
-                try:
-                    tmp = _make_client(values)
-                    projects = tmp._get('/rest/api/3/project')
+                status, projects, tb = run_with_busy(
+                    lambda: _make_client(values)._get('/rest/api/3/project'),
+                    message='Fetching projects…')
+                if status == 'error':
+                    show_error(f"Could not fetch projects:\n{projects}", tb=tb)
+                elif status == 'ok':
                     if isinstance(projects, dict):
                         projects = projects.get('values', [])
                     proj_labels = [f"{p['key']:12s}  {p['name']}" for p in projects]
@@ -551,10 +554,6 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                             window['-CFG-jira.project_key-'].update(chosen)
                             break
                     pw.close()
-                except Exception as exc:
-                    import traceback
-                    show_error(f"Could not fetch projects:\n{exc}",
-                               tb=traceback.format_exc())
 
         # ── Browse Account ID (Jira user search) ──────────────────────────
         elif event == '-BROWSE-ACCOUNT-':
@@ -590,13 +589,13 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                     q = q.strip()
                     if not q:
                         return
-                    try:
-                        users = tmp._get('/rest/api/3/user/search',
-                                         {'query': q, 'maxResults': 30})
-                    except Exception as exc:
-                        import traceback
-                        show_error(f"Could not search users:\n{exc}",
-                                   tb=traceback.format_exc())
+                    status, users, tb = run_with_busy(
+                        lambda: tmp._get('/rest/api/3/user/search',
+                                         {'query': q, 'maxResults': 30}),
+                        message='Searching users…')
+                    if status != 'ok':
+                        if status == 'error':
+                            show_error(f"Could not search users:\n{users}", tb=tb)
                         return
                     if not isinstance(users, list):
                         users = []
@@ -619,12 +618,11 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                         if ue == '-USEARCH-':
                             _do_search(uv.get('-UQ-', ''))
                         elif ue == '-UMYSELF-':
-                            try:
-                                me = tmp.get_myself()
-                            except Exception as exc:
-                                import traceback
-                                show_error(f"Could not load your account:\n{exc}",
-                                           tb=traceback.format_exc())
+                            status, me, tb = run_with_busy(tmp.get_myself,
+                                                           message='Loading your account…')
+                            if status != 'ok':
+                                if status == 'error':
+                                    show_error(f"Could not load your account:\n{me}", tb=tb)
                                 continue
                             aid = me.get('accountId', '')
                             if aid:
@@ -645,16 +643,19 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
         elif event == '-REFRESH-SPRINTS-':
             proj  = values.get('-CFG-jira.project_key-', '').strip()
             token = values.get('-CFG-jira.api_token-', '').strip()
-            sprint_cf = values.get('-CFG-jira.custom_fields.sprint-', '').strip() or 'customfield_10020'
+            sprint_cf = values.get('-CFG-jira.custom_fields.sprint-', '').strip() or DEFAULT_SPRINT_CF
             if not all([token, proj]):
                 sg.popup('Fill in API Token and Project Key first.',
                          title='Refresh Sprints', modal=True, keep_on_top=True)
             elif not _cloud_id_ok(values):
                 pass
             else:
-                try:
-                    tmp = _make_client(values)
-                    sprints = tmp.get_sprints(proj, sprint_cf)
+                status, sprints, tb = run_with_busy(
+                    lambda: _make_client(values).get_sprints(proj, sprint_cf),
+                    message='Fetching sprints…')
+                if status == 'error':
+                    show_error(f"Could not fetch sprints:\n{sprints}", tb=tb)
+                elif status == 'ok':
                     working.setdefault('jira', {})['sprint_cache'] = sprints
                     init_jira_config(working.get('jira', {}))
                     names = [s['name'] for s in sprints]
@@ -663,9 +664,6 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                     sg.popup_quick_message(f"Cached {len(sprints)} sprint(s).",
                                            auto_close_duration=1,
                                            background_color='#2e7d32', text_color='white')
-                except Exception as exc:
-                    import traceback
-                    show_error(f"Could not fetch sprints:\n{exc}", tb=traceback.format_exc())
 
         # ── Test release statuses ──────────────────────────────────────────
         elif event == '-TEST-RELEASE-':
@@ -682,8 +680,12 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
             elif not _cloud_id_ok(values):
                 pass
             else:
-                try:
-                    names = _make_client(values).get_project_statuses(proj)
+                status, names, tb = run_with_busy(
+                    lambda: _make_client(values).get_project_statuses(proj),
+                    message='Fetching project statuses…')
+                if status == 'error':
+                    show_error(f"Could not fetch project statuses:\n{names}", tb=tb)
+                elif status == 'ok':
                     missing = [s for s in (pre, done) if s.lower() not in names]
                     working.setdefault('release', {})['validated'] = not missing
                     window['-RELEASE-STATUS-'].update(_release_status_text(working))
@@ -699,10 +701,6 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                                  + "\n\nCheck spelling/case against your Jira workflow. "
                                    "Release mode stays disabled.",
                                  title='Status not found', modal=True, keep_on_top=True)
-                except Exception as exc:
-                    import traceback
-                    show_error(f"Could not fetch project statuses:\n{exc}",
-                               tb=traceback.format_exc())
 
         # ── Editing a release status invalidates the prior Test ────────────
         elif event in ('-CFG-release.filter_status-', '-CFG-release.done_status-'):
@@ -729,8 +727,17 @@ def show_config_window(config: dict, config_path: Path) -> dict | None:
                     p.collect_config(values, working)
                 except Exception:
                     pass
-            with open(config_path, 'w') as f:
-                yaml.dump(working, f, default_flow_style=False, sort_keys=False)
+            # Prefer the OS credential store for the API token: on success the
+            # YAML carries only the sentinel. Any keyring failure (no backend,
+            # GPO lockdown) keeps today's plaintext behavior.
+            jira_w = working.setdefault('jira', {})
+            token = (jira_w.get('api_token') or '').strip()
+            if token and token != KEYRING_SENTINEL \
+                    and store_token(jira_w.get('user_email', ''), token):
+                jira_w['api_token'] = KEYRING_SENTINEL
+            with open(config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(working, f, default_flow_style=False, sort_keys=False,
+                          allow_unicode=True)
             init_ticket_config(working.get('ticket_types', {}))
             init_jira_config(working.get('jira', {}))
             sg.popup_quick_message('Configuration saved.', auto_close_duration=1,

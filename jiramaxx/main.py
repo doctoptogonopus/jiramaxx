@@ -9,8 +9,8 @@ Usage:
     python main.py --gui     # open GUI directly (skip hotkey daemon)
 """
 from __future__ import annotations
+import copy
 import queue
-import shutil
 import sys
 import threading
 from pathlib import Path
@@ -19,18 +19,15 @@ import yaml
 import PySimpleGUI as sg
 import keyboard
 
-from .api import JiraClient, apply_proxy_env
+from .api import JiraClient, apply_proxy_env, resolve_token
 from .cache import Cache
 from .models import init_ticket_config, init_jira_config
 from .ui import run_main_window, show_interaction_window
 
 # Config lives in the user's home directory, not inside the installed package —
 # site-packages is often read-only (and shared) for pip installs, and credentials
-# do not belong there. The legacy in-package location is migrated on first run.
+# do not belong there.
 CONFIG_PATH = Path.home() / '.jiramaxx' / 'config.yaml'
-LEGACY_CONFIG_PATH = Path(__file__).parent / 'config.yaml'
-# Old scattered drafts location, retired in favor of one folder under base_dir.
-LEGACY_CACHE_DIR = Path.home() / '.jira_tool' / 'cache'
 
 DEFAULT_CONFIG: dict = {
     'jira': {
@@ -38,7 +35,6 @@ DEFAULT_CONFIG: dict = {
         'api_token': '',
         'user_email': '',
         'project_key': 'ENG',
-        'board_id': 1,
         'token_type': 'classic',
         'cloud_id': '',
     },
@@ -77,26 +73,13 @@ DEFAULT_CONFIG: dict = {
 
 
 def data_dir(config: dict) -> Path:
-    """Resolve the drafts directory. Honors an explicit, non-legacy
-    ``cache.directory`` for back-compat; otherwise derives ``<base_dir>/drafts``."""
+    """Resolve the drafts directory. Honors an explicit ``cache.directory`` for
+    back-compat; otherwise derives ``<base_dir>/drafts``."""
     explicit = (config.get('cache') or {}).get('directory')
     if explicit:
-        p = Path(explicit).expanduser()
-        if p != LEGACY_CACHE_DIR:
-            return p
+        return Path(explicit).expanduser()
     base = (config.get('paths') or {}).get('base_dir') or '~/.jiramaxx'
     return Path(base).expanduser() / 'drafts'
-
-
-def migrate_legacy_cache(target: Path) -> None:
-    """One-time relocation of old ~/.jira_tool/cache drafts into the new folder."""
-    if target.exists() or not LEGACY_CACHE_DIR.exists():
-        return
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(LEGACY_CACHE_DIR), str(target))
-    except Exception:
-        pass
 
 
 def enable_system_certs(config: dict) -> None:
@@ -113,25 +96,44 @@ def enable_system_certs(config: dict) -> None:
         pass
 
 
+def _merge_defaults(data: dict, defaults: dict) -> dict:
+    """Deep-merge ``data`` over ``defaults``: every default key is present in the
+    result, user values win, nested dicts merge recursively. Defaults are copied,
+    never aliased, so the result is safe to mutate."""
+    out = copy.deepcopy(defaults)
+    for k, v in (data or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge_defaults(v, out[k])
+        else:
+            out[k] = v
+    return out
+
+
 def load_config() -> dict:
+    """Load ``~/.jiramaxx/config.yaml`` merged over DEFAULT_CONFIG. An empty,
+    partial, or mangled file is a logical case, not an error: it merges to the
+    defaults, so startup always reaches the normal setup prompt."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
-        # One-time migration from the old in-package location, if present.
-        if LEGACY_CONFIG_PATH.exists() and LEGACY_CONFIG_PATH != CONFIG_PATH:
-            try:
-                shutil.copyfile(LEGACY_CONFIG_PATH, CONFIG_PATH)
-            except OSError:
-                pass
-        if not CONFIG_PATH.exists():
-            with open(CONFIG_PATH, 'w') as f:
-                yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False)
-            return dict(DEFAULT_CONFIG)
-    with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False, allow_unicode=True)
+        return copy.deepcopy(DEFAULT_CONFIG)
+    with open(CONFIG_PATH, encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+    return _merge_defaults(data if isinstance(data, dict) else {}, DEFAULT_CONFIG)
+
+
+def save_config(config: dict) -> None:
+    """Persist a (merged) config dict to ``CONFIG_PATH``. Writing the merged
+    dict is the established pattern (config_ui's Save does the same)."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False,
+                  allow_unicode=True)
 
 
 def is_configured(config: dict) -> bool:
-    return bool((config.get('jira', {}).get('api_token') or '').strip())
+    return bool(resolve_token(config.get('jira', {})))
 
 
 def _prompt_setup(config: dict) -> dict:
@@ -150,14 +152,14 @@ def _prompt_setup(config: dict) -> dict:
 
 
 def build_clients(config: dict) -> tuple[Cache, JiraClient]:
-    ddir = data_dir(config)
-    migrate_legacy_cache(ddir)
-    cache = Cache(str(ddir))
+    cache = Cache(str(data_dir(config)))
     jira = JiraClient.from_config(config)
     return cache, jira
 
 
-def main():
+def _bootstrap() -> dict:
+    """Shared startup: load config, wire TLS/proxy/theme, init model registries,
+    and run first-time setup if no token is configured."""
     config = load_config()
     enable_system_certs(config)
     apply_proxy_env(config.get('network', {}))
@@ -168,9 +170,18 @@ def main():
         config = _prompt_setup(config)
         init_ticket_config(config.get('ticket_types', {}))
         init_jira_config(config.get('jira', {}))
+    return config
+
+
+def main():
+    config = _bootstrap()
     cache, jira = build_clients(config)
 
-    hotkeys = config.get('hotkeys', DEFAULT_CONFIG['hotkeys'])
+    if '--gui' in sys.argv:
+        run_main_window(cache, jira, config, CONFIG_PATH)
+        return
+
+    hotkeys = config['hotkeys']  # always present after the defaults merge
     gui_queue: queue.Queue[str] = queue.Queue()
     gui_busy = threading.Lock()
 
@@ -204,19 +215,4 @@ def main():
 
 
 if __name__ == '__main__':
-    config = load_config()
-    enable_system_certs(config)
-    apply_proxy_env(config.get('network', {}))
-    sg.theme(config.get('ui', {}).get('theme', 'DarkBlue3'))
-
-    if '--gui' in sys.argv:
-        init_ticket_config(config.get('ticket_types', {}))
-        init_jira_config(config.get('jira', {}))
-        if not is_configured(config):
-            config = _prompt_setup(config)
-            init_ticket_config(config.get('ticket_types', {}))
-            init_jira_config(config.get('jira', {}))
-        cache, jira = build_clients(config)
-        run_main_window(cache, jira, config, CONFIG_PATH)
-    else:
-        main()
+    main()
