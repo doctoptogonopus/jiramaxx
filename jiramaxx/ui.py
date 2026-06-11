@@ -348,6 +348,25 @@ def _order_popup(options: list[str], current: str) -> str | None:
     return vals.get('-O-') if ev == '-A-' else None
 
 
+def _comment_popup(issue_key: str) -> str | None:
+    """Single-line comment prompt. Returns the text, or None if cancelled."""
+    layout = [
+        [sg.Text(f'Comment for {issue_key}:', font=('Helvetica', 11, 'bold'))],
+        [sg.Input('', key='-CMT-', size=(60, 1))],
+        [sg.Push(), sg.Button('Add', key='-OK-'), sg.Button('Cancel', key='-C-')],
+    ]
+    w = sg.Window('Add Comment', layout, finalize=True, modal=True, keep_on_top=True)
+    w.bind('<Escape>', '-C-')
+    w.bind('<Return>', '-OK-')
+    bring_to_front(w)
+    w['-CMT-'].set_focus()
+    ev, vals = _read(w)
+    w.close()
+    if ev == '-OK-':
+        return (vals.get('-CMT-') or '').strip() or None
+    return None
+
+
 def show_draft_list(drafts: list[Ticket], cache: Cache,
                     config: dict | None = None) -> Ticket | None:
     """Show drafts, let user open/delete/reorder one. Returns the ticket to open."""
@@ -752,6 +771,18 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
                 elem.update(select_rows=[0])
             try:
                 elem.Widget.focus_set()
+                # Arrow keys need the Treeview focus *item*, not just widget focus.
+                if state['view'] == 'flat':
+                    kids = elem.Widget.get_children()
+                    if kids:
+                        elem.Widget.focus(kids[0])
+                else:
+                    tops = elem.Widget.get_children()
+                    if tops:
+                        leaves = elem.Widget.get_children(tops[0])
+                        first = leaves[0] if leaves else tops[0]
+                        elem.Widget.focus(first)
+                        elem.Widget.selection_set(first)
             except Exception:
                 pass
 
@@ -789,8 +820,7 @@ def show_interaction_window(cache: Cache, jira: JiraClient, config: dict):
                 continue
 
             if event == '-COMMENT-':
-                comment = sg.popup_get_text(f'Comment for {issue_key}:',
-                                            title='Add Comment', size=(60, 1))
+                comment = _comment_popup(issue_key)
                 if comment:
                     try:
                         jira.add_comment(issue_key, comment)
@@ -842,7 +872,7 @@ def run_main_window(cache: Cache, jira: JiraClient, config: dict,
                    disabled=len(drafts) == 0)],
         [sg.Button('(M) Manage Tickets', key='-MANAGE-', size=(18, 2)),
          sg.Button('(C) Config',         key='-CONFIG-', size=(18, 2))],
-        *([[sg.Button('(G) Plan Initiative', key='-PLAN-',  size=(38, 2))]]
+        *([[sg.Button('(G) Plan Initiative', key='-PLAN-',  size=(38, 1))]]
           if planner_enabled else []),
         [sg.Button('(Q) Quit',           key='-QUIT-',   size=(38, 1))],
     ]

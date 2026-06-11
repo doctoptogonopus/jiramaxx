@@ -123,6 +123,15 @@ def load_config() -> dict:
     return _merge_defaults(data if isinstance(data, dict) else {}, DEFAULT_CONFIG)
 
 
+def save_config(config: dict) -> None:
+    """Persist a (merged) config dict to ``CONFIG_PATH``. Writing the merged
+    dict is the established pattern (config_ui's Save does the same)."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False,
+                  allow_unicode=True)
+
+
 def is_configured(config: dict) -> bool:
     return bool(resolve_token(config.get('jira', {})))
 

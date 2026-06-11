@@ -9,12 +9,13 @@ through the public ``Cache`` / ``JiraClient`` / model surface.
 from __future__ import annotations
 import math
 import uuid
+from tkinter import colorchooser
 import PySimpleGUI as sg
 from .models import Ticket, TICKET_CLASSES, FIELD_META, ticket_from_dict
 from .cache import Cache, new_plan
 from .api import JiraClient
 from .utils import safe_read as _read, show_error, bring_to_front, run_with_busy
-from .ui import _build_field_row, _soft_select, show_type_selector, _epic_link_cf
+from .ui import _build_field_row, _fkey, _soft_select, show_type_selector, _epic_link_cf
 
 _NODE_W, _NODE_H = 150, 50          # default size; nodes carry their own w/h once resized
 _MIN_W, _MIN_H = 90, 36
@@ -22,6 +23,12 @@ _HANDLE = 16                        # px hit zone of the corner grips
 _CANVAS_W, _CANVAS_H = 920, 560
 _NODE_COLORS = {'Story': '#1565c0', 'Bug': '#c62828', 'Task': '#2e7d32',
                 'Epic': '#6a1b9a', 'Initiative': '#00838f'}
+
+
+def _node_colors(config: dict) -> dict:
+    """Per-type node colors: user overrides from config (planner.node_colors)
+    merged over the defaults. Pure — unit-tested."""
+    return {**_NODE_COLORS, **((config.get('planner') or {}).get('node_colors') or {})}
 
 
 def _node_size(n: dict) -> tuple[int, int]:
@@ -143,7 +150,8 @@ def _draw_directed_edge(graph, a: dict, b: dict, label: str,
 
 
 def _draw_node(graph, n: dict, line_color: str = 'black', line_width: int = 1,
-               head_prefix: str = '', zoom: float = 1.0) -> tuple:
+               head_prefix: str = '', zoom: float = 1.0,
+               colors: dict | None = None) -> tuple:
     """Draw one node rectangle + caption + corner grips; returns
     (rect_fig, text_fig). The caller decides the border styling (selection /
     incomplete / modified / diff colors) and passes view-space nodes (see
@@ -153,7 +161,7 @@ def _draw_node(graph, n: dict, line_color: str = 'black', line_width: int = 1,
     x, y = n['x'], n['y']
     w, h = _node_size(n)
     t = _node_ticket(n)
-    fill = _NODE_COLORS.get(t.ticket_type, '#455a64')
+    fill = (colors or _NODE_COLORS).get(t.ticket_type, '#455a64')
     rect = graph.draw_rectangle((x, y), (x + w, y + h), fill_color=fill,
                                 line_color=line_color, line_width=line_width)
     head = head_prefix + (n.get('jira_key') or t.ticket_type)
@@ -174,32 +182,79 @@ def _draw_node(graph, n: dict, line_color: str = 'black', line_width: int = 1,
     return rect, txt
 
 
-def _planner_node_edit(ticket: Ticket) -> bool:
+def _ticket_from_issue(issue: dict) -> 'Ticket':
+    """Build a Ticket carrying a raw Jira issue's real field values."""
+    f = issue.get('fields', {}) or {}
+    itype = ((f.get('issuetype') or {}).get('name')) or 'Task'
+    cls = TICKET_CLASSES.get(itype, TICKET_CLASSES['Task'])
+    t = cls()
+    t.summary = f.get('summary', '') or ''
+    if f.get('description') is not None:
+        t.description = _adf_to_text(f.get('description'))
+    if (f.get('priority') or {}).get('name'):
+        t.priority = f['priority']['name']
+    if f.get('labels'):
+        t.labels = ', '.join(f['labels'])
+    return t
+
+
+def _planner_node_edit(ticket: Ticket, jira=None, node=None) -> bool:
     """Edit a planner node's ticket fields (Save/Cancel — no Jira submit, that's
     deferred to Push). Mutates ``ticket`` in place; returns True if saved.
     Existing (already-in-Jira) nodes are editable too: their changes are queued
-    and applied to the real ticket on Push (two-way editing)."""
+    and applied to the real ticket on Push (two-way editing).
+
+    When ``node`` and ``jira`` are given and the node has a jira_key, a
+    'Restore from Jira' button lets the user pull the current field values from
+    the live issue, refreshing the diff baseline to Jira's current state."""
     fields = ticket.all_form_fields()
+    has_restore = (node is not None and node.get('jira_key') and jira is not None)
+
+    btn_row = []
+    if has_restore:
+        btn_row.append(sg.Button('Restore from Jira', key='-RESTORE-'))
+    btn_row += [sg.Push(),
+                sg.Button('Save', key='-SAVE-', bind_return_key=False),
+                sg.Button('Cancel', key='-CANCEL-')]
+
     layout = [
         [sg.Text(f'Edit {ticket.ticket_type}', font=('Helvetica', 12, 'bold'))],
         [sg.HSep()],
         *[_build_field_row(f, ticket) for f in fields],
         [sg.HSep()],
-        [sg.Push(),
-         sg.Button('Save', key='-SAVE-', bind_return_key=False),
-         sg.Button('Cancel', key='-CANCEL-')],
+        btn_row,
     ]
     window = sg.Window('Plan node', layout, finalize=True, modal=True,
                        keep_on_top=True, return_keyboard_events=False)
     window.bind('<Escape>', '-CANCEL-')
     bring_to_front(window)
     saved = False
+    fetched = None  # set when a Restore was performed; refreshes the diff baseline
     while True:
         event, values = _read(window)
         if event in (sg.WIN_CLOSED, '-CANCEL-'):
             break
+        if event == '-RESTORE-':
+            status, issue, _ = run_with_busy(
+                lambda: jira.get_issue(node['jira_key']),
+                message=f"Loading {node['jira_key']}…")
+            if status != 'ok':
+                if status == 'error':
+                    show_error(f"Could not load {node['jira_key']}:\n{issue}")
+                continue
+            fresh = _ticket_from_issue(issue)
+            fetched = fresh.to_dict()
+            # Update every form widget in place so the user sees the live values.
+            for f in fields:
+                window[_fkey(f)].update(value=str(getattr(fresh, f, '') or ''))
+            continue
         if event == '-SAVE-':
             ticket.apply_form_values(values)
+            if fetched is not None:
+                # Restore was used — refresh the diff baseline to Jira's current
+                # state so the caller's no-diff check queues nothing for a plain
+                # restore-and-save.
+                node['orig_ticket'] = fetched
             saved = True
             break
     window.close()
@@ -398,17 +453,7 @@ def _adf_to_text(adf) -> str:
 def _existing_node(issue: dict, x: int, y: int) -> dict:
     """Build an 'existing' planner node from a raw Jira issue dict, carrying the
     real field values (where fetched) so edits diff against Jira's state."""
-    f = issue.get('fields', {}) or {}
-    itype = ((f.get('issuetype') or {}).get('name')) or 'Task'
-    cls = TICKET_CLASSES.get(itype, TICKET_CLASSES['Task'])
-    t = cls()
-    t.summary = f.get('summary', '') or ''
-    if f.get('description') is not None:
-        t.description = _adf_to_text(f.get('description'))
-    if (f.get('priority') or {}).get('name'):
-        t.priority = f['priority']['name']
-    if f.get('labels'):
-        t.labels = ', '.join(f['labels'])
+    t = _ticket_from_issue(issue)
     n = _new_node(t, x, y)
     n['kind'] = 'existing'
     n['jira_key'] = issue.get('key')
@@ -839,7 +884,8 @@ def _touches_existing(plan: dict, by_id: dict) -> bool:
     return False
 
 
-def _confirm_push_with_preview(plan: dict, by_id: dict) -> bool:
+def _confirm_push_with_preview(plan: dict, by_id: dict,
+                               colors: dict | None = None) -> bool:
     """Visual diff of what Push will do, drawn with the same graph renderer:
     green = created, orange ✎ = fields updated, green arrow = new relationship,
     red ✕ = relationship removed. Returns True if the user confirms."""
@@ -891,12 +937,12 @@ def _confirm_push_with_preview(plan: dict, by_id: dict) -> bool:
         new = n.get('kind') != 'existing' and not n.get('jira_key')
         if new:
             _draw_node(graph, vn, line_color='#2e7d32', line_width=3,
-                       head_prefix='+ ', zoom=z)
+                       head_prefix='+ ', zoom=z, colors=colors)
         elif n.get('orig_ticket'):
             _draw_node(graph, vn, line_color='#fb8c00', line_width=3,
-                       head_prefix='✎ ', zoom=z)
+                       head_prefix='✎ ', zoom=z, colors=colors)
         else:
-            _draw_node(graph, vn, zoom=z)
+            _draw_node(graph, vn, zoom=z, colors=colors)
     w['-DIFFS-'].update(_push_change_summary(plan, by_id) or '(no changes)')
 
     ev, _ = _read(w)
@@ -913,7 +959,10 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
              'drag_node': None, 'drag_off': (0, 0), 'moved': False,
              'resize_node': None, 'body_press': False, 'pan_press': None,
              'zoom': 1.0, 'pan': (0, 0),
-             'link_types': None, 'arrows': {}, 'hover': None, 'arrow_armed': None}
+             'link_types': None, 'arrows': {}, 'hover': None,
+             'arrow_armed': None, 'ui_armed': None,
+             'colors': _node_colors(config), 'ui_rects': {},
+             'link_from': None}
 
     graph = sg.Graph((_CANVAS_W, _CANVAS_H), (0, _CANVAS_H), (_CANVAS_W, 0),
                      key='-CANVAS-', enable_events=True, drag_submits=True,
@@ -921,18 +970,16 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     layout = [
         [sg.Text(plan.get('name', 'Plan'), font=('Helvetica', 13, 'bold')),
          sg.Push(), sg.Text('', key='-PSTATUS-', font=('Helvetica', 8))],
-        [sg.Button('Add Ticket', key='-ADD-'),
-         sg.Button('Edit', key='-EDIT-', disabled=True),
-         sg.Button('Delete', key='-DEL-', disabled=True),
-         sg.Button('−', key='-ZOUT-', size=(2, 1), tooltip='Zoom out (Ctrl+wheel)'),
-         sg.Button('⊙', key='-ZRESET-', size=(2, 1), tooltip='Reset zoom & pan'),
-         sg.Button('+', key='-ZIN-', size=(2, 1), tooltip='Zoom in (Ctrl+wheel)'),
+        [sg.Button('(A) Add Ticket', key='-ADD-'),
+         sg.Button('(⏎) Edit', key='-EDIT-', disabled=True),
+         sg.Button('(Del) Delete', key='-DEL-', disabled=True),
          sg.Push(),
-         sg.Button('Push to Jira', key='-PUSH-'),
-         sg.Button('Save', key='-PSAVE-'),
+         sg.Button('(P) Push to Jira', key='-PUSH-'),
+         sg.Button('(Ctrl+S) Save', key='-PSAVE-'),
          sg.Button('Close', key='-PCLOSE-')],
         [graph],
         [sg.Text('Hover a node and click a side arrow to add a connected ticket · '
+                 'yellow top arrow links to another node on the canvas · '
                  'drag the ≡ grip (top-right) to move, the ◢ grip (bottom-right) to '
                  'resize · click a node or a line to select it · drag empty space '
                  'to pan, Ctrl+wheel to zoom.',
@@ -941,6 +988,16 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     window = sg.Window(f"Plan — {plan.get('name', '')}", layout, finalize=True,
                        return_keyboard_events=False)
     bring_to_front(window)
+    # Canvas hotkeys — n/N/a/A spawn nodes; p/P pushes; Return edits; Delete
+    # deletes; Ctrl+S saves; Escape cancels link mode or clears selection.
+    for k, ev in [('n', '-NSPAWN-'), ('N', '-NSPAWN-'), ('a', '-ADD-'), ('A', '-ADD-'),
+                  ('p', '-PUSH-'), ('P', '-PUSH-')]:
+        window.bind(k, ev)
+    window.bind('<Return>', '-EDIT-')
+    window.bind('<Delete>', '-DEL-')
+    window.bind('<Control-s>', '-PSAVE-')
+    window.bind('<Control-S>', '-PSAVE-')
+    window.bind('<Escape>', '-PESC-')
 
     figmap: dict = {}
 
@@ -999,11 +1056,13 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             pts = [(bx + px * _ARROW_HALF, by + py * _ARROW_HALF),
                    (bx - px * _ARROW_HALF, by - py * _ARROW_HALF),
                    (bx + dx * _ARROW_L, by + dy * _ARROW_L)]
+            # N arrow is soft yellow (link mode); E/W/S are the usual slate.
+            arrow_fill = '#ffe082' if side == 'N' else '#90a4ae'
             try:
                 # stipple ≈ translucency (tk canvas has no real alpha)
                 fid = graph.Widget.create_polygon(
                     *[c for p in pts for c in p],
-                    fill='#90a4ae', stipple='gray50', outline='')
+                    fill=arrow_fill, stipple='gray50', outline='')
             except Exception:
                 return
             state['arrows'][fid] = (n['node_id'], side)
@@ -1071,6 +1130,9 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     graph.Widget.bind('<Motion>', _on_motion, add='+')
     graph.Widget.bind('<Leave>', lambda e: _clear_arrows(), add='+')
     graph.Widget.bind('<Control-MouseWheel>', _on_wheel, add='+')
+    graph.Widget.bind('<Double-Button-1>',
+                      lambda e: window.write_event_value('-NODE-DBL-', (e.x, e.y)),
+                      add='+')
 
     # ── Rendering & selection ────────────────────────────────────────────────
 
@@ -1078,6 +1140,7 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         graph.erase()
         state['arrows'].clear()
         state['hover'] = None
+        state['ui_rects'].clear()
         z, pan = state['zoom'], state['pan']
         view = {nid: _view_node(n, z, pan) for nid, n in by_id.items()}
         for i, e in enumerate(edges):
@@ -1106,8 +1169,40 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             else:
                 lc, lw = 'black', 1
             prefix = '⚠ ' if incomplete else ('✎ ' if dirty else '')
-            rect, txt = _draw_node(graph, view[n['node_id']], lc, lw, prefix, zoom=z)
+            rect, txt = _draw_node(graph, view[n['node_id']], lc, lw, prefix,
+                                   zoom=z, colors=state['colors'])
             figmap[n['node_id']] = {'rect': rect, 'text': txt}
+
+        # ── Canvas-space UI: zoom buttons (top-right) — always on top ─────────
+        # These are drawn in screen coords and never move with zoom/pan.
+        for i, (sym, action) in enumerate([('−', 'zout'), ('⊙', 'zreset'), ('+', 'zin')]):
+            bx = _CANVAS_W - 8 - (3 - i) * 26
+            by_ = 8
+            x1, y1, x2, y2 = bx, by_, bx + 22, by_ + 22
+            graph.draw_rectangle((x1, y1), (x2, y2),
+                                 fill_color='#eceff1', line_color='#90a4ae')
+            graph.draw_text(sym, (bx + 11, by_ + 11), color='#37474f',
+                            font=('Helvetica', 10, 'bold'))
+            state['ui_rects'][action] = (x1, y1, x2, y2)
+
+        # ── Color legend (bottom-left) — one swatch per type, stacked upward ──
+        row_y = _CANVAS_H - 10
+        for tname, tcolor in state['colors'].items():
+            x1, y1, x2, y2 = 10, row_y - 10, 20, row_y
+            graph.draw_rectangle((x1, y1), (x2, y2),
+                                 fill_color=tcolor, line_color=tcolor)
+            graph.draw_text(tname, (25, row_y - 5), color='#607d8b',
+                            font=('Helvetica', 7), text_location=sg.TEXT_LOCATION_LEFT)
+            state['ui_rects'][f'legend:{tname}'] = (x1, y1 - 2, x2 + 60, y2 + 2)
+            row_y -= 14
+
+    def _ui_at(pt) -> str | None:
+        """Return the action key whose ui_rect contains the screen point, else None."""
+        px, py = pt
+        for action, (x1, y1, x2, y2) in state['ui_rects'].items():
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                return action
+        return None
 
     def fig_to_node(figs) -> str | None:
         rev = {}
@@ -1187,6 +1282,27 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         set_selected(nid=node['node_id'])
         _status()
 
+    def _pick_relationship_dialog(opts: list, current_label: str,
+                                   title: str = 'Edit relationship') -> dict | None:
+        """Small combo-picker for choosing a relationship. Returns the selected
+        payload dict or None if cancelled. Shared by _edit_edge and link mode."""
+        labels = [o[0] for o in opts]
+        cur = current_label if current_label in labels else labels[0]
+        lay = [[sg.Text(f'{title}  (source → target)',
+                        font=('Helvetica', 11, 'bold'))],
+               [sg.Combo(labels, default_value=cur, key='-R-', readonly=True,
+                         size=(44, 1))],
+               [sg.Push(), sg.Button('Apply', key='-OK-'), sg.Button('Cancel', key='-C-')]]
+        w = sg.Window(title, lay, finalize=True, modal=True, keep_on_top=True)
+        w.bind('<Escape>', '-C-')
+        w.bind('<Return>', '-OK-')
+        bring_to_front(w)
+        ev, vals = _read(w)
+        w.close()
+        if ev != '-OK-' or vals.get('-R-') not in labels:
+            return None
+        return dict(opts[labels.index(vals['-R-'])][1])
+
     def _edit_edge(idx: int) -> None:
         """Re-type the selected relationship; a pushed one is queued for removal
         in Jira and replaced by the new (unpushed) edge."""
@@ -1201,21 +1317,9 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
                         and bool(payload.get('reverse')) == bool(e.get('reverse'))):
                     cur = lbl
                     break
-        lay = [[sg.Text('Change relationship  (source → target)',
-                        font=('Helvetica', 11, 'bold'))],
-               [sg.Combo(labels, default_value=cur, key='-R-', readonly=True,
-                         size=(44, 1))],
-               [sg.Push(), sg.Button('Apply', key='-OK-'), sg.Button('Cancel', key='-C-')]]
-        w = sg.Window('Edit relationship', lay, finalize=True, modal=True,
-                      keep_on_top=True)
-        w.bind('<Escape>', '-C-')
-        w.bind('<Return>', '-OK-')
-        bring_to_front(w)
-        ev, vals = _read(w)
-        w.close()
-        if ev != '-OK-' or vals.get('-R-') not in labels:
+        payload = _pick_relationship_dialog(opts, cur, title='Change relationship')
+        if payload is None:
             return
-        payload = dict(opts[labels.index(vals['-R-'])][1])
         a, b = by_id.get(e['from']), by_id.get(e['to'])
         if not a or not b:
             return
@@ -1236,6 +1340,22 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         set_selected()
         _status()
 
+    def edit_node(n: dict) -> None:
+        """Edit the ticket fields of node ``n`` in place; queue the changes for Push
+        when saving an existing (pushed) ticket."""
+        t = _node_ticket(n)
+        if _planner_node_edit(t, jira=jira, node=n):
+            # First edit of a pushed ticket snapshots the Jira-side state so Push
+            # can send exactly the changed fields.  Restore may have already set
+            # orig_ticket — the guard below won't clobber that baseline.
+            if n.get('kind') == 'existing' and not n.get('orig_ticket'):
+                n['orig_ticket'] = dict(n['ticket'])
+            n['ticket'] = t.to_dict()
+            if (n.get('orig_ticket')
+                    and not _node_field_diff(n['orig_ticket'], n['ticket'])):
+                n.pop('orig_ticket', None)  # edited back — nothing queued
+            redraw()
+
     redraw()
     _status()
 
@@ -1252,7 +1372,9 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
 
         if event == '-CANVAS-':
             pt = values['-CANVAS-']
-            if pt == (None, None) or state['arrow_armed'] is not None:
+            if (pt == (None, None)
+                    or state['arrow_armed'] is not None
+                    or state['ui_armed'] is not None):
                 continue
             wpt = _to_world(pt)
             if state['drag_node'] is not None:
@@ -1273,6 +1395,11 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
                 state['moved'] = True
                 redraw()
             elif not state['body_press']:  # first press of this gesture
+                # Check canvas UI buttons before anything else (screen coords).
+                action = _ui_at(pt)
+                if action is not None:
+                    state['ui_armed'] = action
+                    continue
                 figs = graph.get_figures_at_location(pt)
                 arrow = next((state['arrows'][f] for f in figs
                               if f in state['arrows']), None)
@@ -1301,25 +1428,85 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
         if event == '-CANVAS-+UP':
             pt = values.get('-CANVAS-')
             armed, state['arrow_armed'] = state['arrow_armed'], None
+            ui_action, state['ui_armed'] = state['ui_armed'], None
+            # Pop link_from early so every path below can inspect it.
+            link_src_id, state['link_from'] = state['link_from'], None
             dragged = ((state['drag_node'] is not None
                         or state['resize_node'] is not None) and state['moved'])
             panned = state['pan_press'] is not None and state['moved']
             grabbed = state['drag_node'] or state['resize_node']
             state.update(drag_node=None, resize_node=None, pan_press=None,
                          moved=False, body_press=False)
+            if ui_action is not None:
+                if link_src_id:
+                    state['link_from'] = link_src_id  # keep link mode armed
+                if ui_action == 'zin':
+                    _set_zoom(state['zoom'] * 1.2)
+                elif ui_action == 'zout':
+                    _set_zoom(state['zoom'] / 1.2)
+                elif ui_action == 'zreset':
+                    state['zoom'] = 1.0
+                    state['pan'] = (0, 0)
+                    redraw()
+                    _status()
+                elif ui_action.startswith('legend:'):
+                    tname = ui_action.split(':', 1)[1]
+                    _, hexcolor = colorchooser.askcolor(
+                        color=state['colors'].get(tname),
+                        title=f'{tname} color',
+                        parent=graph.Widget)
+                    if hexcolor:
+                        state['colors'][tname] = hexcolor
+                        config.setdefault('planner', {}).setdefault('node_colors', {})[tname] = hexcolor
+                        from .main import save_config  # lazy — avoids import cycle
+                        save_config(config)
+                        redraw()
+                continue
             if armed is not None:
                 src = by_id.get(armed[0])
                 if src is not None:
-                    _spawn_from(src, armed[1])
+                    if armed[1] == 'N':
+                        # N arrow enters link mode rather than spawning a new node.
+                        state['link_from'] = armed[0]
+                        set_selected(nid=armed[0])
+                        _status('Link mode: click the target node (Esc cancels)')
+                    else:
+                        _spawn_from(src, armed[1])
                 continue
             if panned:
+                # A drag while in link mode just moves the node; keep link mode armed.
+                if link_src_id:
+                    state['link_from'] = link_src_id
                 continue  # the view moved; selection unchanged
             if dragged:
+                # Node/resize drag while link mode is active — keep link mode alive.
+                if link_src_id:
+                    state['link_from'] = link_src_id
                 set_selected(nid=grabbed)
             else:
                 valid = pt and pt != (None, None)
                 clicked = fig_to_node(graph.get_figures_at_location(pt)) if valid else None
-                if clicked is not None:
+                if link_src_id is not None:
+                    # Link mode: this plain click resolves the target.
+                    if not clicked or clicked == link_src_id:
+                        # Same node or empty click — cancel link mode.
+                        _status()
+                    else:
+                        src_node = by_id.get(link_src_id)
+                        tgt_node = by_id.get(clicked)
+                        if src_node and tgt_node:
+                            opts = _relationship_options(jira, cache, state)
+                            labels = [o[0] for o in opts]
+                            payload = _pick_relationship_dialog(
+                                opts, labels[0], title='Link')
+                            if payload is not None:
+                                _apply_relationship(edges, src_node, tgt_node,
+                                                    payload, plan, by_id)
+                            set_selected()
+                            _status()
+                        else:
+                            _status()
+                elif clicked is not None:
                     set_selected(nid=clicked)
                 else:
                     # ~6 screen px tolerance regardless of zoom.
@@ -1329,18 +1516,37 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
                     set_selected(edge_idx=eidx)
             continue
 
-        if event in ('-ZIN-', '-ZOUT-'):
-            _set_zoom(state['zoom'] * (1.2 if event == '-ZIN-' else 1 / 1.2))
-            continue
+        if event == '-NODE-DBL-':
+            # Double-click to edit: cancel any in-flight gesture, then open the
+            # node editor directly — no extra click required.
+            state.update(drag_node=None, resize_node=None, pan_press=None,
+                         moved=False, body_press=False)
+            state['arrow_armed'] = None
+            state['ui_armed'] = None
+            dbl_pt = values.get('-NODE-DBL-')
+            if dbl_pt and dbl_pt != (None, None):
+                wx, wy = _to_world(dbl_pt)
+                dbl_node = _node_at(wx, wy)
+                if dbl_node:
+                    set_selected(nid=dbl_node['node_id'])
+                    edit_node(dbl_node)
 
-        if event == '-ZRESET-':
-            state['zoom'] = 1.0
-            state['pan'] = (0, 0)
-            redraw()
-            _status()
-            continue
+        elif event == '-NSPAWN-':
+            # n/N hotkey: spawn from the selected node (S-side) or add freely.
+            if state['selected'] and state['selected'] in by_id:
+                _spawn_from(by_id[state['selected']], 'S')
+            else:
+                _spawn_from(None, None)
 
-        if event == '-ADD-':
+        elif event == '-PESC-':
+            # Escape: cancel link mode first; else clear selection. Never closes.
+            if state['link_from']:
+                state['link_from'] = None
+                _status()
+            elif state['selected'] is not None or state['selected_edge'] is not None:
+                set_selected()
+
+        elif event == '-ADD-':
             _spawn_from(None, None)
 
         elif event == '-EDIT-':
@@ -1349,17 +1555,7 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             elif state['selected']:
                 n = by_id.get(state['selected'])
                 if n:
-                    t = _node_ticket(n)
-                    if _planner_node_edit(t):
-                        # First edit of a pushed ticket snapshots the Jira-side
-                        # state so Push can send exactly the changed fields.
-                        if n.get('kind') == 'existing' and not n.get('orig_ticket'):
-                            n['orig_ticket'] = dict(n['ticket'])
-                        n['ticket'] = t.to_dict()
-                        if (n.get('orig_ticket')
-                                and not _node_field_diff(n['orig_ticket'], n['ticket'])):
-                            n.pop('orig_ticket', None)  # edited back — nothing queued
-                        redraw()
+                    edit_node(n)
 
         elif event == '-DEL-':
             if state['selected_edge'] is not None and state['selected_edge'] < len(edges):
@@ -1408,7 +1604,7 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
             # Touching content already in Jira warrants the visual diff review;
             # a pure-new plan keeps the simple confirm.
             if _touches_existing(plan, by_id):
-                go = _confirm_push_with_preview(plan, by_id)
+                go = _confirm_push_with_preview(plan, by_id, colors=state['colors'])
             else:
                 go = sg.popup_yes_no('Create the draft tickets and links in Jira now?',
                                      title='Push to Jira', modal=True,
@@ -1445,29 +1641,50 @@ def show_plan_canvas(cache: Cache, jira: JiraClient, config: dict, plan: dict) -
     window.close()
 
 
+def _plan_label(p: dict, project_key: str) -> str:
+    """One picker row. Jira-backed plans (name starts with the project key) that
+    still hold unpushed local work get a leading '*' — the offline tell that
+    edits to live tickets are waiting."""
+    star = (p.get('name', '').startswith(project_key + '-')
+            and _worth_saving(p))
+    prefix = '* ' if star else '  '
+    return (prefix
+            + f"{p.get('name', '(unnamed)'):30s}  {len(p.get('nodes', []))} node(s)"
+            f"   {(p.get('created_at') or '')[:10]}")
+
+
 def show_plan_picker(cache: Cache, jira: JiraClient, config: dict) -> None:
     """List initiative plans; open / create / delete. Loops until closed."""
     while True:
         plans = cache.list_plans()
-        labels = [f"{p.get('name', '(unnamed)'):30s}  {len(p.get('nodes', []))} node(s)"
-                  f"   {(p.get('created_at') or '')[:10]}" for p in plans]
+        proj_key = (config.get('jira') or {}).get('project_key', '')
+        labels = [_plan_label(p, proj_key) for p in plans]
+        any_starred = any(lbl.startswith('* ') for lbl in labels)
+        starred_row = ([sg.Text('* unpushed local changes', font=('Helvetica', 8))]
+                       if any_starred else [])
         layout = [
             [sg.Text('Initiative Plans', font=('Helvetica', 13, 'bold'))],
             [sg.Listbox(labels, size=(60, min(len(labels) + 1, 12)), key='-PL-',
                         font=('Consolas', 10), enable_events=False,
                         select_mode=sg.LISTBOX_SELECT_MODE_BROWSE)],
+            starred_row,
             [sg.Push(),
              sg.Button('Open', key='-OPEN-'),
-             sg.Button('Open from Jira', key='-OPENJ-',
+             sg.Button('(O) Open from Jira', key='-OPENJ-',
                        tooltip='Load an existing ticket and graph its children '
                                'and dependency links'),
-             sg.Button('New plan', key='-NEWP-'),
+             sg.Button('(N) New plan', key='-NEWP-'),
              sg.Button('Delete', key='-DELP-'),
              sg.Button('Close', key='-CLOSE-')],
         ]
         window = sg.Window('Plans', layout, finalize=True, modal=True, keep_on_top=True)
         window.bind('<Escape>', '-CLOSE-')
         window.bind('<Return>', '-OPEN-')
+        window.bind('o', '-OPENJ-')
+        window.bind('O', '-OPENJ-')
+        window.bind('n', '-NEWP-')
+        window.bind('N', '-NEWP-')
+        window.bind('<Delete>', '-DELP-')
         bring_to_front(window)
         if plans:
             _soft_select(window, 0, key='-PL-')

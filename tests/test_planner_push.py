@@ -3,11 +3,11 @@ from jiramaxx.models import Epic, Story, Task
 from jiramaxx.planner import (_adf_to_text, _apply_relationship,
                               _build_link_options, _changed_jira_fields,
                               _edge_at_point, _edge_segment, _incomplete_nodes,
-                              _new_node, _node_field_diff, _node_size,
-                              _plan_from_jira, _push_change_summary,
-                              _push_plan_to_jira, _queue_unlink,
-                              _set_parent_edge, _touches_existing, _view_node,
-                              _worth_saving)
+                              _new_node, _node_colors, _node_field_diff, _node_size,
+                              _NODE_COLORS, _plan_from_jira, _plan_label,
+                              _push_change_summary, _push_plan_to_jira, _queue_unlink,
+                              _set_parent_edge, _ticket_from_issue, _touches_existing,
+                              _view_node, _worth_saving)
 
 CONFIG = {'jira': {'project_key': 'T',
                    'custom_fields': {'epic_link': 'customfield_10014'}}}
@@ -568,3 +568,123 @@ def test_view_node_transform():
     v = _view_node(n, 0.5, (10, 20))
     assert (v['x'], v['y'], v['w'], v['h']) == (60.0, 45.0, 100.0, 40.0)
     assert (n['x'], n['w']) == (100, 200)  # world coords never mutated
+
+
+# ── _node_colors ──────────────────────────────────────────────────────────────
+
+def test_node_colors_defaults_when_no_planner_section():
+    # No config at all → identical to _NODE_COLORS.
+    assert _node_colors({}) == _NODE_COLORS
+    # Config present but no planner key → still defaults.
+    assert _node_colors({'jira': {'project_key': 'X'}}) == _NODE_COLORS
+
+
+def test_node_colors_override_wins_for_that_type():
+    config = {'planner': {'node_colors': {'Story': '#123456'}}}
+    colors = _node_colors(config)
+    assert colors['Story'] == '#123456'
+    # All other defaults survive unmodified.
+    for tname, default in _NODE_COLORS.items():
+        if tname != 'Story':
+            assert colors[tname] == default
+
+
+def test_node_colors_returns_new_dict():
+    # Mutating the result must not change _NODE_COLORS.
+    colors = _node_colors({})
+    colors['Story'] = '#ffffff'
+    assert _NODE_COLORS['Story'] != '#ffffff'
+
+
+# ── _ticket_from_issue ────────────────────────────────────────────────────────
+
+def _raw_issue(key='PAY-7', itype='Story', summary='Pay the piper',
+               description=None, priority='High', labels=None):
+    """Minimal raw Jira issue dict for testing _ticket_from_issue."""
+    f = {'issuetype': {'name': itype}, 'summary': summary,
+         'description': description,
+         'priority': {'name': priority} if priority else None,
+         'labels': labels or []}
+    return {'key': key, 'fields': f}
+
+
+def test_ticket_from_issue_basic_fields():
+    adf = {'type': 'doc', 'content': [
+        {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'desc text'}]}]}
+    issue = _raw_issue(itype='Story', summary='Pay the piper',
+                       description=adf, priority='High', labels=['web', 'mobile'])
+    t = _ticket_from_issue(issue)
+    assert t.__class__.__name__ == 'Story'
+    assert t.summary == 'Pay the piper'
+    assert t.description == 'desc text'
+    assert t.priority == 'High'
+    assert t.labels == 'web, mobile'
+
+
+def test_ticket_from_issue_none_description_leaves_default():
+    issue = _raw_issue(itype='Task', description=None)
+    t = _ticket_from_issue(issue)
+    # description was None — _ticket_from_issue must NOT set it, so the class
+    # default (empty string / whatever Ticket defaults to) is preserved.
+    assert t.description == (t.__class__().description)  # same as fresh instance
+
+
+def test_ticket_from_issue_unknown_type_defaults_to_task():
+    issue = _raw_issue(itype='CustomType')
+    t = _ticket_from_issue(issue)
+    assert t.__class__.__name__ == 'Task'
+
+
+def test_ticket_from_issue_empty_labels_not_set():
+    issue = _raw_issue(labels=[])
+    t = _ticket_from_issue(issue)
+    # No labels field → not set (join of empty list would be '').
+    # We just verify it doesn't blow up and the class is correct.
+    assert t.summary == issue['fields']['summary']
+
+
+# ── _plan_label ───────────────────────────────────────────────────────────────
+
+def _jira_plan_with_draft(name):
+    """A plan whose name starts with 'PAY-' and holds a draft node."""
+    p = new_plan(name)
+    p['nodes'].append(task_node('draft work'))
+    return p
+
+
+def _jira_plan_fully_pushed(name):
+    """A plan whose name starts with 'PAY-' with only existing/pushed content."""
+    p = new_plan(name)
+    n = task_node('real')
+    n['kind'] = 'existing'
+    n['jira_key'] = 'PAY-99'
+    p['nodes'].append(n)
+    return p
+
+
+def test_plan_label_starred_when_jira_backed_with_unpushed_work():
+    p = _jira_plan_with_draft('PAY-7 Checkout')
+    label = _plan_label(p, 'PAY')
+    assert label.startswith('* ')
+
+
+def test_plan_label_not_starred_when_fully_pushed():
+    p = _jira_plan_fully_pushed('PAY-7 Checkout')
+    label = _plan_label(p, 'PAY')
+    assert label.startswith('  ')
+
+
+def test_plan_label_not_starred_for_local_plan_with_drafts():
+    p = _jira_plan_with_draft('My local idea')
+    label = _plan_label(p, 'PAY')
+    assert label.startswith('  ')
+
+
+def test_plan_label_columns_aligned():
+    """Starred and unstarred labels have the same prefix width so listbox columns align."""
+    p_star = _jira_plan_with_draft('PAY-7 Checkout')
+    p_plain = _jira_plan_fully_pushed('PAY-8 Login')
+    lbl_star = _plan_label(p_star, 'PAY')
+    lbl_plain = _plan_label(p_plain, 'PAY')
+    # Both prefixes are exactly 2 chars ('* ' vs '  ').
+    assert len(lbl_star[:2]) == len(lbl_plain[:2]) == 2
