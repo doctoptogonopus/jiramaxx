@@ -852,7 +852,7 @@ def _push_change_summary(plan: dict, by_id: dict) -> str:
         a, b = by_id.get(e.get('from')), by_id.get(e.get('to'))
         if not a or not b:
             continue
-        line = f"Relationship: {_name(a)} —{_edge_label(e)}→ {_name(b)}"
+        line = f"Relationship: {_name(a)} — {_edge_label(e)} → {_name(b)}"
         owner = b if (_is_new(b) and not _is_new(a)) else a
         add(_name(owner), line)
     for u in plan.get('pending_unlinks') or []:
