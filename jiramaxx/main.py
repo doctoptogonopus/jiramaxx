@@ -24,6 +24,11 @@ from .cache import Cache
 from .models import init_ticket_config, init_jira_config
 from .ui import run_main_window, show_interaction_window
 
+import tkinter
+def _trace(self, mode, callback):
+    return self.trace_add({'w': 'write', 'r': 'read', 'u': 'unset'}.get(mode, mode), callback)
+tkinter.Variable.trace = _trace
+
 # Config lives in the user's home directory, not inside the installed package —
 # site-packages is often read-only (and shared) for pip installs, and credentials
 # do not belong there.
